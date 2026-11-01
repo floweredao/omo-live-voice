@@ -232,7 +232,7 @@ describe("classifyUtterance", () => {
     },
   );
 
-  test.each(["그만 하고 테스트 돌려줘", "그만큼 해봤어", "취소하지 말고 계속해", "please stop now"])("sentence containing a cancel word is a message: %p", (w) => {
+  test.each(["그만 하고 테스트 돌려줘", "그만큼 해봤어", "취소하지 말고 계속해", "please stop now", "그만?", "stop!!", "취소。"])("sentence containing a cancel word is a message: %p", (w) => {
     expect(classifyUtterance(w, none).kind).toBe("message");
     expect(classifyUtterance(w, pq).kind).toBe("message");
   });

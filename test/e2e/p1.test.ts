@@ -584,11 +584,15 @@ describe("P1 e2e: bridge vs fake GPT-Live / extension / panel", () => {
     expect(r.errs.some((l) => l.msg.includes("question_chunk_timeout"))).toBe(false);
   }, 120_000);
 
-  test("(2e) OLV_FAKE_MUTE_OUTPUT=1: 15 s chunk timeout, panel error question_speech_timeout, exactly one append", async () => {
+  test("(2e) OLV_FAKE_MUTE_OUTPUT=1: one retry then 15 s timeout and panel error question_speech_timeout", async () => {
     const r = await runQuestion({ OLV_FAKE_MUTE_OUTPUT: "1" }, "timeout");
     const appends = r.tap.filter((e) => e.dir === "in" && e.type === "session.instructions.append");
     expect(r.timeoutLog!.t - appends[0]!.t).toBeGreaterThanOrEqual(14_900);
-    expect(r.log.filter((e) => e.type === "session.instructions.append")).toHaveLength(1);
+    expect(r.log.filter((e) => e.type === "session.instructions.append")).toHaveLength(2);
+    expect(appends).toHaveLength(2);
+    expect(appends[1]!.ev.content).toBe(appends[0]!.ev.content);
+    expect(appends[1]!.ev.event_id).not.toBe(appends[0]!.ev.event_id);
+    expect(appends[1]!.t - appends[0]!.t).toBeGreaterThanOrEqual(3900);
     expect(r.timeoutPanelError).toMatchObject({ type: "error", code: "question_speech_timeout", recoverable: true });
     expect(envs(r.summary, "error").some((e) => e.code === "question_speech_timeout")).toBe(true);
   }, 60_000);

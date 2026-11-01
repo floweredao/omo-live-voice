@@ -255,7 +255,11 @@ export type Utterance =
   | { kind: "answer"; requestId: string; optionIndex: number }
   | { kind: "message"; text: string };
 
-const CANCEL_RE = /^(그만|그만해|그만해요|취소|취소해|취소해요|멈춰|멈춰줘|멈춰요|스톱|stop)$/i;
+const CANCEL_RE = /^(그만|그만해|그만해요|취소|취소해|취소해요|멈춰|멈춰줘|멈춰요|스톱|stop)[.!]?$/i;
+
+export function isStandaloneCancel(text: string): boolean {
+  return CANCEL_RE.test(text.trim());
+}
 
 function normalize(s: string): string {
   return s.trim().replace(/\s+/g, " ").replace(/[.!?。]+$/, "").trim();
@@ -294,7 +298,7 @@ export function classifyUtterance(
   ctx: { pendingQuestion: { requestId: string; options: string[] } | null },
 ): Utterance {
   const n = normalize(text);
-  if (CANCEL_RE.test(n)) return { kind: "cancel" };
+  if (isStandaloneCancel(text)) return { kind: "cancel" };
   const pq = ctx.pendingQuestion;
   if (pq && n) {
     const hits = new Set<number>();

@@ -19,6 +19,7 @@ export class Guard {
   private warnCancel: (() => void) | undefined;
   private capCancel: (() => void) | undefined;
   private busy = false;
+  private speaking = false;
   private idleFired = false;
   private warned = false;
   private capped = false;
@@ -68,6 +69,11 @@ export class Guard {
     this.resetIdle();
   }
 
+  setUserSpeaking(speaking: boolean): void {
+    this.speaking = speaking;
+    this.resetIdle();
+  }
+
   cumulativeMs(): number {
     return this.elapsedMs + (this.connectedAt === undefined ? 0 : this.options.now() - this.connectedAt);
   }
@@ -79,7 +85,7 @@ export class Guard {
   private resetIdle(): void {
     this.idleCancel?.();
     this.idleCancel = undefined;
-    if (this.connectedAt === undefined || this.busy || this.idleFired) return;
+    if (this.connectedAt === undefined || this.busy || this.speaking || this.idleFired) return;
     this.idleCancel = this.options.schedule(() => {
       this.idleCancel = undefined;
       this.idleFired = true;

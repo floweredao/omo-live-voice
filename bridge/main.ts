@@ -12,7 +12,7 @@ import type {
   StateMsg,
 } from "../shared/protocol.ts";
 import { MAX_FRAME_SAMPLES } from "../shared/protocol.ts";
-import { classifyUtterance, initialAdapterState, reduceAgent, type AdapterState, type LiveCommand } from "./adapter.ts";
+import { classifyUtterance, initialAdapterState, isStandaloneCancel, reduceAgent, type AdapterState, type LiveCommand } from "./adapter.ts";
 import { base64ToPcm, InputPacer, isVoiced, transcriptWindow, VoiceActivity } from "./audio.ts";
 import { CAP_MS, COMMENTARY_CAP_CHARS, IDLE_MS, KEYCHAIN_SERVICE, LIVE_VOICE, SETTLE_MS, WARN_MS } from "./config.ts";
 import { readExt, sendExt } from "./ext-link.ts";
@@ -28,10 +28,13 @@ const TICK_MS = 100;
 const OUTPUT_RMS = 300;
 const MIC_RMS = 500;
 const OUTPUT_END_MS = 600;
+// Live has no response-end event: question chunks require BOTH streams to be quiet.
+const QUESTION_QUIESCENCE_MS = 600;
 const TRAILING_SILENCE_MS = 600;
 const SPEECH_END_MS = 600;
 const DRAIN_FALLBACK_MS = 300;
 const QUESTION_CHUNK_TIMEOUT_MS = 15_000;
+const QUESTION_START_MS = 4_000;
 const SHUTDOWN_CLOSE_MS = 2_000;
 const CUT_PAD_MS = 500;
 const SEND_WORDS = /^(보내|보내줘|전송|send)$/i;
@@ -86,6 +89,7 @@ guard.onCap = () => dispatch({ type: "guard.cap" });
 const pacer = new InputPacer();
 const vad = new VoiceActivity(MIC_RMS, 300, now);
 let captureEnabled = false;
+let muteControlled = false;
 
 let fragments: Fragment[] = [];
 let lastCutMs = 0;
@@ -98,6 +102,9 @@ let pending: PendingUtterance | null = null;
 let draft: { id: string; text: string } | null = null;
 let heldDuringQuestion: string | null = null;
 let cancelText = "";
+let inputTurn: Fragment[] = [];
+let lastInputDeltaAt = -Infinity;
+let cancelledThroughMs = -1;
 
 let outGen = 0;
 let outSeq = 0;
@@ -150,6 +157,7 @@ function dispatch(event: Event): void {
       const ev = queue.shift()!;
       const result = transition(state, ev);
       const wasBusy = state.agent !== "idle";
+      const wasSpeaking = state.input === "speech";
       state = result.state;
       if (outGen !== state.playbackGeneration) {
         outGen = state.playbackGeneration;
@@ -163,6 +171,7 @@ function dispatch(event: Event): void {
         }
       }
       if (wasBusy !== (state.agent !== "idle")) guard.setAgentBusy(state.agent !== "idle");
+      if (wasSpeaking !== (state.input === "speech")) guard.setUserSpeaking(state.input === "speech");
     }
   } finally {
     dispatching = false;
@@ -276,11 +285,38 @@ function sendUser(final: boolean): void {
   panel?.send({ type: "transcript", speaker: "user", utteranceId: userUtteranceId, revision: ++userRevision, text: userText, final, interrupted: false });
 }
 
+// P0 has only streamed deltas, no final event or server speech-end event.
+// Complete a local turn after mic speech ends AND 600 ms without another delta.
+// Re-arm on late ASR words; never classify an individual streamed prefix.
+function completeInputTurn(): void {
+  if (state.input === "speech" || now() - lastInputDeltaAt < SPEECH_END_MS) return;
+  const turn = inputTurn;
+  inputTurn = [];
+  const endMs = turn.at(-1)?.endMs;
+  const text = turn.map((f) => f.text).join("").trim();
+  if (endMs === undefined || !isStandaloneCancel(text) ||
+    (state.agent !== "working" && state.agent !== "submitting" && state.agent !== "question")) return;
+  cancelledThroughMs = endMs;
+  lastCutMs = Math.max(lastCutMs, endMs);
+  fragments = fragments.filter((f) => f.endMs > endMs);
+  timers.cancel("state.settle");
+  timers.cancel("state.ackWindow");
+  sendUser(true);
+  userUtteranceId = nextId("u");
+  userText = fragments.map((f) => f.text).join("");
+  userRevision = 0;
+  pending = null;
+  cancelQuestion();
+  cancelText = text;
+  dispatch({ type: "utterance.committed", kind: "cancel" });
+}
+
 function settleUtterance(offsetMs: number, delegationId: string | null): void {
   const cut = offsetMs + CUT_PAD_MS;
   const text = transcriptWindow(fragments, lastCutMs, cut).trim();
   lastCutMs = cut;
   fragments = fragments.filter((f) => f.endMs > cut);
+  inputTurn = inputTurn.filter((f) => f.endMs > cut);
   sendUser(true);
   userUtteranceId = nextId("u");
   userText = fragments.map((f) => f.text).join("");
@@ -379,7 +415,7 @@ function onOutputAudio(e: LiveEvent): void {
     outputEndedLocal = false;
     timers.cancel("drainFallback");
     timers.start("outputEnd", OUTPUT_END_MS, onOutputEnd);
-    if (chunkRun) chunkRun.sawStart = true;
+    questionProgress();
     if (state.output === "idle") dispatch({ type: "output.start" });
     if (state.output === "speaking") forwardPcm(pcm);
     return;
@@ -421,7 +457,7 @@ function onPlayback(msg: PlaybackMsg): void {
 
 
 function startQuestion(chunks: string[], delegationId: string | null): void {
-  timers.cancel("questionChunk");
+  cancelQuestion();
   chunkRun = chunks.length ? { base: nextId("question"), chunks, index: 0, sawStart: false, delegationId } : null;
   sendNextChunk();
 }
@@ -434,21 +470,50 @@ function sendNextChunk(): void {
     return;
   }
   run.sawStart = false; // observer armed BEFORE the append: an early output.start is kept
+  armQuestionTimeout();
+  // An appended acknowledgement is not speech. Retry only this chunk, once, without
+  // extending its existing 15-second start/stall deadline.
+  timers.start("questionStart", QUESTION_START_MS, () => {
+    if (chunkRun !== run || run.sawStart) return;
+    log("info", `question_chunk_retry chunk=${run.index + 1}/${run.chunks.length}`);
+    appendQuestionChunk(nextId("question-retry"));
+  });
+  appendQuestionChunk(`${run.base}-${run.index + 1}`);
+}
+
+function appendQuestionChunk(eventId: string): void {
+  const run = chunkRun;
+  if (!run) return;
+  if (!live?.instructions(run.chunks[run.index]!, run.delegationId, eventId)) {
+    log("warn", "question_chunk_not_sent");
+    cancelQuestion();
+  }
+}
+
+function questionProgress(): void {
+  if (!chunkRun) return;
+  chunkRun.sawStart = true;
+  timers.cancel("questionStart");
+  armQuestionTimeout();
+  // Either voiced PCM or nonempty transcript progress postpones the SAME deadline.
+  // Continuous silent PCM and append acknowledgements postpone neither deadline.
+  timers.start("outputEnd", QUESTION_QUIESCENCE_MS, onOutputEnd);
+}
+
+function armQuestionTimeout(): void {
+  const run = chunkRun;
+  if (!run) return;
   timers.start("questionChunk", QUESTION_CHUNK_TIMEOUT_MS, () => {
     log("warn", `question_chunk_timeout chunk=${run.index + 1}/${run.chunks.length}`);
     panel?.send({ type: "error", code: "question_speech_timeout", message: "질문을 읽지 못했어요. 화면을 확인해 주세요.", recoverable: true });
-    chunkRun = null;
+    cancelQuestion();
   });
-  if (!live?.instructions(run.chunks[run.index]!, run.delegationId, `${run.base}-${run.index + 1}`)) {
-    log("warn", "question_chunk_not_sent");
-    timers.cancel("questionChunk");
-    chunkRun = null;
-  }
 }
 
 function cancelQuestion(): void {
   chunkRun = null;
   timers.cancel("questionChunk");
+  timers.cancel("questionStart");
 }
 
 
@@ -508,13 +573,20 @@ function onAgent(msg: ExtToBridge): void {
   guard.activity("agent");
   switch (msg.type) {
     case "agent.delta":
-    case "agent.tool.start":
       if (state.agent === "submitting" || state.agent === "working" || state.agent === "question")
-        dispatch({ type: "agent.working", ...(msg.type === "agent.tool.start" ? { tool: msg.name } : {}) });
+        dispatch({ type: "agent.working" });
+      return;
+    case "agent.tool.start":
+      dispatch({ type: "agent.working", tool: msg.name });
       return;
     case "agent.idle":
-      if (!msg.idle && state.agent === "submitting") dispatch({ type: "agent.accepted" });
-      if (msg.idle && state.agent === "cancelling") dispatch({ type: "agent.cancelDone" });
+      if (!msg.idle) {
+        dispatch({ type: state.agent === "submitting" ? "agent.accepted" : "agent.working" });
+      } else {
+        cancelQuestion();
+        dispatch({ type: state.agent === "cancelling" ? "agent.cancelDone" : "agent.end" });
+        runDelegationId = null;
+      }
       return;
     case "agent.end":
       cancelQuestion();
@@ -560,7 +632,10 @@ function onPanel(conn: PanelConn): void {
     pacer.push(new Uint8Array(frame.pcm.buffer, frame.pcm.byteOffset, frame.pcm.byteLength));
     const cue = vad.classify(frame.pcm, state.output === "speaking");
     if (isVoiced(frame.pcm, MIC_RMS)) {
-      timers.start("speechEnd", SPEECH_END_MS, () => dispatch({ type: "speech.end" }));
+      timers.start("speechEnd", SPEECH_END_MS, () => {
+        dispatch({ type: "speech.end" });
+        completeInputTurn();
+      });
       guard.activity("speech");
     }
     if (cue === "interrupt") dispatch({ type: "interrupt" });
@@ -587,12 +662,14 @@ function onPanel(conn: PanelConn): void {
 function onControl(action: "mute" | "unmute" | "stop" | "resume" | "confirm" | "discard"): void {
   switch (action) {
     case "mute":
-      live?.mute().catch((e: Error) => log("warn", `mute_failed ${e.message.slice(0, 80)}`));
+      muteControlled = true;
       flushReason = "mute";
-      return dispatch({ type: "mute" });
+      dispatch({ type: "mute" });
+      return syncLiveMute();
     case "unmute":
-      live?.unmute().catch((e: Error) => log("warn", `unmute_failed ${e.message.slice(0, 80)}`));
-      return dispatch({ type: "unmute" });
+      muteControlled = true;
+      dispatch({ type: "unmute" });
+      return syncLiveMute();
     case "stop":
       flushReason = "stop";
       return dispatch({ type: "stop" });
@@ -612,6 +689,11 @@ function onControl(action: "mute" | "unmute" | "stop" | "resume" | "confirm" | "
   }
 }
 
+function syncLiveMute(): void {
+  if (!live?.ready) return;
+  const action = state.muted ? "mute" : "unmute";
+  live[action]().catch((e: Error) => log("warn", `${action}_failed ${e.message.slice(0, 80)}`));
+}
 
 function openLive(): void {
   if (live) return log("warn", "open_while_live");
@@ -620,6 +702,10 @@ function openLive(): void {
   closeReason = undefined;
   fragments = [];
   lastCutMs = 0;
+  inputTurn = [];
+  lastInputDeltaAt = -Infinity;
+  cancelledThroughMs = -1;
+  timers.cancel("inputComplete");
   const mine = (fn: (e: LiveEvent) => void) => (e: LiveEvent) => {
     if (live === session) fn(e);
   };
@@ -629,11 +715,18 @@ function openLive(): void {
     connectedAt = now();
     guard.connected();
     dispatch({ type: "live.started" });
+    if (muteControlled) syncLiveMute();
   }));
   session.onEvent("session.input_transcript.delta", mine((e) => {
-    const text = String(e.delta ?? "");
+    if (typeof e.delta !== "string") return;
+    const text = e.delta;
     const startMs = Number(e.start_ms ?? 0);
     const endMs = Number(e.end_ms ?? startMs);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs || endMs <= cancelledThroughMs) return;
+    if (startMs - (inputTurn.at(-1)?.endMs ?? startMs) >= SPEECH_END_MS) inputTurn = [];
+    inputTurn.push({ text, startMs, endMs });
+    lastInputDeltaAt = now();
+    timers.start("inputComplete", SPEECH_END_MS, completeInputTurn);
     fragments.push({ text, startMs, endMs });
     userText += text;
     sendUser(false);
@@ -642,6 +735,7 @@ function openLive(): void {
   }));
   session.onEvent("session.output_transcript.delta", mine((e) => {
     const text = String(e.delta ?? "");
+    if (text.trim()) questionProgress();
     assistantText += text;
     sendAssistant(false);
     transcript?.delta("어시스턴트", text, Number(e.start_ms ?? 0), Number(e.end_ms ?? 0));
@@ -651,6 +745,7 @@ function openLive(): void {
     const id = String(e.delegation?.id ?? "");
     if (!id) return log("warn", "delegation_without_id");
     delegationOffsetMs = Number(e.offset_ms ?? 0);
+    if (delegationOffsetMs <= cancelledThroughMs) return;
     dispatch({ type: "delegation.created", id, offsetMs: delegationOffsetMs });
   }));
   session.onEvent("session.usage.updated", mine(() => sendCost()));
@@ -668,6 +763,9 @@ function openLive(): void {
       panel?.send({ type: "error", code: "live_dropped", message: "Live connection dropped", recoverable: true });
     }
     cancelQuestion();
+    timers.cancel("inputComplete");
+    timers.cancel("speechEnd");
+    inputTurn = [];
     dispatch({ type: "live.closed", reason: closeReason });
   }));
   session.start().catch((err: Error) => {
@@ -691,6 +789,9 @@ function closeLive(): void {
   const session = live;
   live = null;
   cancelQuestion();
+  timers.cancel("inputComplete");
+  timers.cancel("speechEnd");
+  inputTurn = [];
   if (connectedAt !== null) {
     guard.disconnected();
     sendCost();
@@ -727,7 +828,7 @@ async function boot(): Promise<void> {
     panelDir = resolve(import.meta.dir, "../panel");
   }
   try {
-    server = await startServer({ panelDir, token, allowedOrigins: [], onPanel, log: (level, msg) => level === "debug" || log(level, msg) });
+    server = await startServer({ panelDir, token, allowedOrigins: [], onPanel, qa: () => hello?.qa ?? false, log: (level, msg) => level === "debug" || log(level, msg) });
   } catch (e) {
     log("error", `server_start_failed ${(e as Error).message.slice(0, 120)}`);
     return shutdown(1, "server_start_failed");

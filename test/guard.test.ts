@@ -57,6 +57,25 @@ describe("Guard", () => {
     expect(idle).toBe(1);
   });
 
+  test("user speech pauses idle until the speech segment ends", () => {
+    // Given
+    const c = clock();
+    const guard = new Guard({ idleMs: 2000, capMs: 60000, warnMs: 50000, now: c.now, schedule: c.schedule });
+    let idle = 0;
+    guard.onIdle = () => idle++;
+    guard.connected();
+    // When
+    guard.setUserSpeaking(true);
+    c.advanceTo(10000);
+    // Then
+    expect(idle).toBe(0);
+    guard.setUserSpeaking(false);
+    c.advanceTo(11999);
+    expect(idle).toBe(0);
+    c.advanceTo(12000);
+    expect(idle).toBe(1);
+  });
+
   test("warns at 55 minutes and caps at 60 minutes", () => {
     const c = clock();
     const guard = new Guard({ idleMs: 180_000, capMs: 3_600_000, warnMs: 3_300_000, now: c.now, schedule: c.schedule });
