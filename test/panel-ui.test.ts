@@ -3,11 +3,19 @@ import type { BridgeToPanel } from "../shared/protocol.ts";
 import { decodeFrame, encodeFrame } from "../shared/protocol.ts";
 import {
   MAX_UTTERANCES,
+  QUESTION_HINT_KO,
   agentBadgeText,
   applyEnvelope,
+  controlButtonStates,
   formatCost,
+  formatErrorKo,
+  guardCloseBannerParts,
+  guardCloseBannerText,
   initialViewState,
+  isBridgeDisconnected,
+  isGuardClosed,
   resolvePersistedDevices,
+  resumeButtonText,
   serializeDevicesMsg,
   stateBadgeText,
   type PanelViewState,
@@ -99,6 +107,8 @@ describe("panel/viewmodel", () => {
     s = applyEnvelope(s, stateEnv({ agent: "question" }));
     expect(agentBadgeText(s)).toBe("질문 대기");
     expect(s.question).toEqual(question);
+    expect(QUESTION_HINT_KO).toBe("질문은 OmO 화면에서 선택해 주세요.");
+    expect(QUESTION_HINT_KO).not.toContain("말해");
 
     s = applyEnvelope(s, env({ type: "agent", status: "working" }));
     expect(s.question).toBeNull();
@@ -156,11 +166,74 @@ describe("panel/viewmodel", () => {
 
     s = applyEnvelope(s, env({ type: "error", code: "unauthorized", message: "bad token", recoverable: false }));
     expect(s.error!.message).toContain("인증");
-    expect(s.error!.message).toContain("bad token");
+    expect(s.error!.message).toContain("토큰");
+    expect(s.error!.message).not.toMatch(/[A-Za-z]/);
     s = applyEnvelope(s, env({ type: "error", code: "answer_on_screen", message: "화면에서 답해 주세요", recoverable: true }));
     expect(s.error).toEqual({ code: "answer_on_screen", message: "화면에서 답해 주세요", recoverable: true });
     s = applyEnvelope(s, env({ type: "error", code: "weird_code", message: "", recoverable: true }));
-    expect(s.error!.message).toBe("오류가 발생했어요 (weird_code)");
+    expect(s.error!.message).toBe("오류가 발생했어요.");
+    expect(formatErrorKo("live_unavailable", "unavailable")).toContain("다시 연결하지 못했어요");
+  });
+
+  test("reconnect and guard-close resume helpers expose Korean copy, cumulative cost, and control hierarchy", () => {
+    let s = initialViewState();
+    expect(isBridgeDisconnected(s)).toBe(false);
+    expect(isGuardClosed(s)).toBe(false);
+    expect(resumeButtonText(s)).toBe("재개");
+    expect(guardCloseBannerText(s)).toBe("");
+    expect(guardCloseBannerParts(s)).toBeNull();
+    expect(controlButtonStates(s)).toEqual({
+      muteDisabled: true,
+      resumeDisabled: true,
+      resumePrimary: false,
+      stopDisabled: false,
+    });
+
+    s = applyEnvelope(s, stateEnv({ connection: "open" }));
+    expect(controlButtonStates(s)).toEqual({
+      muteDisabled: false,
+      resumeDisabled: true,
+      resumePrimary: false,
+      stopDisabled: false,
+    });
+
+    s = applyEnvelope(s, env({ type: "cost", connectedMs: 60_000, cumulativeMs: 185_000, estimatedUsd: 0.154 }));
+    s = applyEnvelope(s, stateEnv({ connection: "closed", reason: "idle" }));
+    expect(isGuardClosed(s)).toBe(true);
+    expect(isBridgeDisconnected(s)).toBe(false);
+    expect(resumeButtonText(s)).toBe("재개 (03:05 · 예상 $0.15)");
+    expect(guardCloseBannerParts(s)).toEqual({
+      reason: "대기 시간 초과로 음성 세션이 일시정지되었어요 · ",
+      cost: "누적 03:05 · 예상 $0.15",
+    });
+    expect(guardCloseBannerText(s)).toBe("대기 시간 초과로 음성 세션이 일시정지되었어요 · 누적 03:05 · 예상 $0.15");
+    expect(controlButtonStates(s)).toEqual({
+      muteDisabled: true,
+      resumeDisabled: false,
+      resumePrimary: true,
+      stopDisabled: false,
+    });
+
+    s = applyEnvelope(s, stateEnv({ connection: "closed", reason: "cap" }));
+    expect(isGuardClosed(s)).toBe(true);
+    expect(resumeButtonText(s)).toBe("재개 (03:05 · 예상 $0.15)");
+    expect(guardCloseBannerText(s)).toContain("시간 한도 도달");
+    expect(guardCloseBannerText(s)).toContain("03:05 · 예상 $0.15");
+    expect(controlButtonStates(s).stopDisabled).toBe(false);
+    expect(controlButtonStates(s).resumePrimary).toBe(true);
+
+    s = applyEnvelope(s, stateEnv({ connection: "closed", reason: "ws_closed" }));
+    expect(isBridgeDisconnected(s)).toBe(true);
+    expect(isGuardClosed(s)).toBe(false);
+    expect(resumeButtonText(s)).toBe("재개");
+    expect(guardCloseBannerText(s)).toBe("");
+    expect(guardCloseBannerParts(s)).toBeNull();
+    expect(controlButtonStates(s)).toEqual({
+      muteDisabled: true,
+      resumeDisabled: true,
+      resumePrimary: false,
+      stopDisabled: true,
+    });
   });
 });
 

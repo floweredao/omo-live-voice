@@ -39,6 +39,15 @@
 
     <p id="notice" class="notice" data-testid="notice" role="status" hidden></p>
 
+    <div id="reconnect-banner" class="banner banner-reconnect" data-testid="reconnect-banner" role="alert" hidden>
+      <span id="reconnect-text" class="banner-text">연결이 끊겼어요</span>
+      <button id="reconnect" type="button" class="btn btn-sm btn-primary" data-testid="reconnect">다시 연결</button>
+    </div>
+
+    <div id="guard-banner" class="banner banner-guard" data-testid="guard-banner" role="status" hidden>
+      <span id="guard-text" class="banner-text"><span id="guard-reason"></span><span id="guard-cost" class="u-nowrap"></span></span>
+    </div>
+
     <div id="error" class="toast" data-testid="error" role="alert" hidden>
       <span id="error-text" class="toast-text"></span>
       <button id="error-dismiss" type="button" class="toast-dismiss" aria-label="알림 닫기">닫기</button>
@@ -49,7 +58,7 @@
       <h2 id="question-header" class="question-header"></h2>
       <p id="question-body" class="question-body"></p>
       <ol id="question-options" class="question-options"></ol>
-      <p class="card-hint">번호나 항목 이름을 말해 주세요.</p>
+      <p id="question-hint" class="card-hint" data-testid="question-hint">질문은 OmO 화면에서 선택해 주세요.</p>
     </section>
 
     <section id="draft" class="card card-draft" data-testid="draft" aria-live="polite" hidden>
@@ -87,12 +96,12 @@
 
     <footer class="controls">
       <div class="controls-row">
-        <button id="mute" type="button" class="btn btn-mute" data-testid="mute" aria-pressed="false" title="단축키: M 또는 스페이스">
-          <span class="btn-dot" aria-hidden="true"></span><span id="mute-label">음소거 (M)</span>
+        <button id="mute" type="button" class="btn btn-mute" data-testid="mute" aria-pressed="false" title="단축키: 스페이스">
+          <span class="btn-dot" aria-hidden="true"></span><span id="mute-label">음소거</span>
         </button>
         <button id="resume" type="button" class="btn" data-testid="resume" disabled>재개</button>
-        <button id="stop" type="button" class="btn btn-danger" data-testid="stop">중지</button>
-        <button id="qa-inject" type="button" class="btn btn-ghost" data-testid="qa-inject" hidden>QA 음성 주입</button>
+        <button id="stop" type="button" class="btn btn-danger" data-testid="stop" title="단축키: 이스케이프">중지</button>
+        <button id="qa-inject" type="button" class="btn btn-ghost" data-testid="qa-inject" hidden>테스트 음성 주입</button>
       </div>
       <div class="devices">
         <label class="device">

@@ -2,11 +2,17 @@
 import { MAX_FRAME_SAMPLES, type BridgeToPanel } from "../shared/protocol.ts";
 import { PanelAudio, armAudioContext, audioCapabilities, listDevices, parseQaParams, type AudioDevice } from "./audio.ts";
 import {
+  QUESTION_HINT_KO,
   agentBadgeText,
   applyEnvelope,
+  controlButtonStates,
   formatCost,
+  guardCloseBannerParts,
   initialViewState,
+  isBridgeDisconnected,
+  isGuardClosed,
   resolvePersistedDevices,
+  resumeButtonText,
   stateBadgeKey,
   stateBadgeText,
   type PanelViewState,
@@ -25,6 +31,8 @@ const EMPTY_ASSISTANT_COPY = "어시스턴트의 말이 여기에 나타나요."
 const GESTURE_NOTICE = "마이크를 켜려면 화면을 한 번 클릭하거나 아무 키나 눌러 주세요.";
 const MIC_DENIED_KO = "마이크 권한이 거부되었어요. 브라우저 설정에서 마이크 권한을 허용해 주세요.";
 const NOT_CONNECTED_KO = "브리지에 연결되어 있지 않아요.";
+const RECONNECT_BANNER_KO = "연결이 끊겼어요";
+const STOP_CONFIRM_KO = "음성 세션을 중지할까요?";
 
 interface OlvHook {
   stats: { consumed: number; buffered: number; generation: number; lastFlushAck: number | null };
@@ -56,6 +64,10 @@ function probeSampleRate(): number {
   }
 }
 
+function formatErrMsg(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  return /[가-힣]/.test(raw) ? raw : "";
+}
 function isMicPermissionError(err: unknown): boolean {
   const name = (err as { name?: string } | null)?.name ?? "";
   return name === "NotAllowedError" || name === "PermissionDeniedError" || name === "SecurityError";
@@ -142,6 +154,12 @@ function bootPanel(): void {
   const stateText = el<HTMLElement>("state-text");
   const agentPill = el<HTMLElement>("agent-state");
   const noticeEl = el<HTMLElement>("notice");
+  const reconnectBanner = el<HTMLElement>("reconnect-banner");
+  const reconnectText = el<HTMLElement>("reconnect-text");
+  const reconnectBtn = el<HTMLButtonElement>("reconnect");
+  const guardBanner = el<HTMLElement>("guard-banner");
+  const guardReason = el<HTMLElement>("guard-reason");
+  const guardCost = el<HTMLElement>("guard-cost");
   const errorToast = el<HTMLElement>("error");
   const errorText = el<HTMLElement>("error-text");
   const errorDismiss = el<HTMLButtonElement>("error-dismiss");
@@ -149,6 +167,7 @@ function bootPanel(): void {
   const questionHeader = el<HTMLElement>("question-header");
   const questionBody = el<HTMLElement>("question-body");
   const questionOptions = el<HTMLOListElement>("question-options");
+  const questionHint = el<HTMLElement>("question-hint");
   const draftCard = el<HTMLElement>("draft");
   const draftText = el<HTMLElement>("draft-text");
   const draftConfirm = el<HTMLButtonElement>("draft-confirm");
@@ -166,6 +185,10 @@ function bootPanel(): void {
   const deviceOutput = el<HTMLSelectElement>("device-output");
 
   const params = new URLSearchParams(location.search);
+  const themeParam = params.get("theme");
+  if (themeParam === "light" || themeParam === "dark") {
+    document.documentElement.dataset.theme = themeParam;
+  }
   const token = params.get("token") ?? "";
   const port = location.port || DEFAULT_PORT;
   const qaParams = parseQaParams(location.search, location.href);
@@ -190,7 +213,8 @@ function bootPanel(): void {
     shell.dataset.state = key;
     statePill.dataset.state = key;
     stateText.textContent = stateBadgeText(state);
-    sessionLabel.textContent = state.title ?? (state.sessionId || "세션 연결 중");
+    const rawLabel = state.title ?? state.sessionId;
+    sessionLabel.textContent = rawLabel && /[가-힣]/.test(rawLabel) ? rawLabel : (state.sessionId ? "활성 세션" : "세션 연결 중");
     costEl.textContent = formatCost(state.cumulativeMs, state.estimatedUsd);
 
     const agentText = agentBadgeText(state);
@@ -201,8 +225,18 @@ function bootPanel(): void {
     noticeEl.textContent = needsGesture ? GESTURE_NOTICE : "";
     noticeEl.hidden = !needsGesture;
 
+    const disconnected = isBridgeDisconnected(state);
+    reconnectText.textContent = RECONNECT_BANNER_KO;
+    reconnectBanner.hidden = !disconnected;
+    reconnectBtn.disabled = !disconnected;
+
+    const guardParts = guardCloseBannerParts(state);
+    guardReason.textContent = guardParts?.reason ?? "";
+    guardCost.textContent = guardParts?.cost ?? "";
+    guardBanner.hidden = !isGuardClosed(state);
+
     errorText.textContent = state.error?.message ?? "";
-    errorToast.hidden = state.error === null;
+    errorToast.hidden = state.error === null || disconnected;
 
     if (state.agent === "question" && state.question) {
       questionHeader.textContent = state.question.header;
@@ -214,6 +248,7 @@ function bootPanel(): void {
           return li;
         }),
       );
+      questionHint.textContent = QUESTION_HINT_KO;
       questionCard.hidden = false;
     } else {
       questionCard.hidden = true;
@@ -225,10 +260,14 @@ function bootPanel(): void {
     renderCaptions(userCaption, userCount, state.userCaptions, EMPTY_USER_COPY);
     renderCaptions(assistantCaption, assistantCount, state.assistantCaptions, EMPTY_ASSISTANT_COPY);
 
+    const controls = controlButtonStates(state);
     muteBtn.setAttribute("aria-pressed", String(state.muted));
-    muteLabel.textContent = state.muted ? "음소거 해제 (M)" : "음소거 (M)";
-    resumeBtn.disabled = state.connection !== "closed";
-    stopBtn.disabled = state.connection === "closed";
+    muteBtn.disabled = controls.muteDisabled;
+    muteLabel.textContent = state.muted ? "음소거 해제" : "음소거";
+    resumeBtn.textContent = resumeButtonText(state);
+    resumeBtn.disabled = controls.resumeDisabled;
+    resumeBtn.classList.toggle("btn-primary", controls.resumePrimary);
+    stopBtn.disabled = controls.stopDisabled;
     qaInjectBtn.hidden = !state.qa;
   }
 
@@ -313,7 +352,8 @@ function bootPanel(): void {
         return instance;
       } catch (err) {
         audioBoot = null;
-        showError("audio_init_failed", `오디오를 초기화하지 못했어요. (${err instanceof Error ? err.message : String(err)})`, true);
+        const detail = formatErrMsg(err);
+        showError("audio_init_failed", detail ? `오디오를 초기화하지 못했어요. (${detail})` : "오디오를 초기화하지 못했어요.", true);
         return null;
       }
     })();
@@ -336,7 +376,10 @@ function bootPanel(): void {
     } catch (err) {
       captureState = "idle";
       if (isMicPermissionError(err)) showError("mic_permission_denied", MIC_DENIED_KO, false);
-      else showError("mic_capture_failed", `마이크 입력을 시작하지 못했어요. (${err instanceof Error ? err.message : String(err)})`, true);
+      else {
+        const detail = formatErrMsg(err);
+        showError("mic_capture_failed", detail ? `마이크 입력을 시작하지 못했어요. (${detail})` : "마이크 입력을 시작하지 못했어요.", true);
+      }
     }
   }
 
@@ -357,7 +400,7 @@ function bootPanel(): void {
       return;
     }
     const res = await fetch(href);
-    if (!res.ok) throw new Error(`QA WAV ${href}: HTTP ${res.status}`);
+    if (!res.ok) throw new Error(`샘플 오디오를 불러오지 못했어요 (${res.status})`);
     const pcm = wavPcm16(await res.arrayBuffer());
     for (let off = 0, seq = 0; off < pcm.length; off += MAX_FRAME_SAMPLES, seq++) {
       const frame = new Int16Array(MAX_FRAME_SAMPLES);
@@ -380,9 +423,86 @@ function bootPanel(): void {
     render();
   }
 
+  function connectBridge(isReconnectAttempt = false): void {
+    ws?.close();
+    if (isReconnectAttempt) {
+      state = { ...state, connection: "connecting", closeReason: null, error: null };
+      render();
+    }
+    const client = connectPanelWs({
+      port,
+      token,
+      capabilities: caps,
+      sampleRate: probeSampleRate(),
+      handlers: {
+        onEnvelope(env: BridgeToPanel) {
+          if (ws !== client) return;
+          const wasOpen = state.connection === "open";
+          state = applyEnvelope(state, env);
+          switch (env.type) {
+            case "hello":
+              void ensureAudio();
+              void refreshDevices();
+              break;
+            case "flush":
+              if (audio) {
+                audio.flush(env.generation);
+              } else {
+                stats.lastFlushAck = env.generation;
+                stats.buffered = 0;
+                ws?.sendPlayback({ generation: env.generation, consumedSamples: stats.consumed, bufferedSamples: 0, flushAck: env.generation });
+              }
+              break;
+            case "state":
+              audio?.setMuted(env.muted);
+              if (env.connection === "open" && !env.muted) void startCaptureIfReady();
+              if (env.connection === "closed" && wasOpen) stopCapture();
+              break;
+            default:
+              break;
+          }
+          render();
+        },
+        onPcm(frame: PcmFrame) {
+          if (ws !== client) return;
+          if (audio) {
+            audio.play(frame.generation, frame.pcm);
+            return;
+          }
+          stats.generation = frame.generation;
+          stats.consumed += frame.pcm.length;
+          ws?.sendPlayback({ generation: frame.generation, consumedSamples: stats.consumed, bufferedSamples: 0 });
+        },
+        onError(err) {
+          if (ws !== client) return;
+          if (isReconnectAttempt && err.code === "unauthorized") return;
+          showError(err.code, err.message, err.recoverable);
+        },
+        onClose(ev) {
+          if (ws !== client) return;
+          stopCapture();
+          if (ev.hadHello || isReconnectAttempt) {
+            if (toastTimer) clearTimeout(toastTimer);
+            toastTimer = null;
+            state = {
+              ...state,
+              connection: "closed",
+              closeReason: "ws_closed",
+              draft: null,
+              error: null,
+            };
+            render();
+          }
+        },
+      },
+    });
+    ws = client;
+  }
+
   muteBtn.addEventListener("click", toggleMute);
   resumeBtn.addEventListener("click", () => void sendControl("resume"));
   stopBtn.addEventListener("click", () => void sendControl("stop"));
+  reconnectBtn.addEventListener("click", () => connectBridge(true));
   draftConfirm.addEventListener("click", () => void sendControl("confirm"));
   draftDiscard.addEventListener("click", () => void sendControl("discard"));
   errorDismiss.addEventListener("click", () => {
@@ -390,7 +510,10 @@ function bootPanel(): void {
     render();
   });
   qaInjectBtn.addEventListener("click", () => {
-    injectQaWav(qaOpts.qaWav ?? DEFAULT_QA_WAV).catch((err) => showError("qa_inject_failed", `QA 음성을 주입하지 못했어요. (${String(err)})`, true));
+    injectQaWav(qaOpts.qaWav ?? DEFAULT_QA_WAV).catch((err) => {
+      const detail = formatErrMsg(err);
+      showError("qa_inject_failed", detail ? `테스트 음성을 주입하지 못했어요. (${detail})` : "테스트 음성을 주입하지 못했어요.", true);
+    });
   });
   deviceInput.addEventListener("change", () => {
     selected = { ...selected, input: deviceInput.value || undefined };
@@ -414,9 +537,22 @@ function bootPanel(): void {
     const tag = target?.tagName ?? "";
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable) return;
     if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.repeat) return;
+    if (ev.key === "Enter" && state.draft !== null) {
+      if (tag === "BUTTON" && target !== draftConfirm) return;
+      ev.preventDefault();
+      sendControl("confirm");
+      return;
+    }
+    if (ev.key === "Escape") {
+      if (isBridgeDisconnected(state)) return;
+      ev.preventDefault();
+      if (window.confirm(STOP_CONFIRM_KO)) sendControl("stop");
+      return;
+    }
     const isM = ev.key === "m" || ev.key === "M" || ev.key === "ㅁ";
     const isSpace = ev.code === "Space" || ev.key === " ";
     if (!isM && !(isSpace && tag !== "BUTTON")) return;
+    if (state.connection !== "open") return;
     ev.preventDefault();
     toggleMute();
   });
@@ -433,62 +569,11 @@ function bootPanel(): void {
   renderDevices();
 
   if (!token) {
-    showError("unauthorized", "인증 토큰이 없어요 (unauthorized). /voice 명령이 연 패널 주소로 접속해 주세요.", false);
+    showError("unauthorized", "인증 토큰이 없어요. 음성 시작 명령이 연 패널 주소로 접속해 주세요.", false);
     return;
   }
 
-  ws = connectPanelWs({
-    port,
-    token,
-    capabilities: caps,
-    sampleRate: probeSampleRate(),
-    handlers: {
-      onEnvelope(env: BridgeToPanel) {
-        const wasOpen = state.connection === "open";
-        state = applyEnvelope(state, env);
-        switch (env.type) {
-          case "hello":
-            void ensureAudio();
-            void refreshDevices();
-            break;
-          case "flush":
-            if (audio) {
-              audio.flush(env.generation);
-            } else {
-              stats.lastFlushAck = env.generation;
-              stats.buffered = 0;
-              ws?.sendPlayback({ generation: env.generation, consumedSamples: stats.consumed, bufferedSamples: 0, flushAck: env.generation });
-            }
-            break;
-          case "state":
-            audio?.setMuted(env.muted);
-            if (env.connection === "open" && !env.muted) void startCaptureIfReady();
-            if (env.connection === "closed" && wasOpen) stopCapture();
-            break;
-          default:
-            break;
-        }
-        render();
-      },
-      onPcm(frame: PcmFrame) {
-        if (audio) {
-          audio.play(frame.generation, frame.pcm);
-          return;
-        }
-        stats.generation = frame.generation;
-        stats.consumed += frame.pcm.length;
-        ws?.sendPlayback({ generation: frame.generation, consumedSamples: stats.consumed, bufferedSamples: 0 });
-      },
-      onError: (err) => showError(err.code, err.message, err.recoverable),
-      onClose(ev) {
-        stopCapture();
-        if (ev.hadHello && state.connection !== "closed") {
-          state = { ...state, connection: "closed", closeReason: "ws_closed", error: { code: "ws_closed", message: "브리지와의 연결이 끊어졌어요.", recoverable: false } };
-          render();
-        }
-      },
-    },
-  });
+  connectBridge(false);
 }
 
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", bootPanel, { once: true });

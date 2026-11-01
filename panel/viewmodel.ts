@@ -73,9 +73,45 @@ const ERROR_KO: Record<string, string> = {
   hello_required: "연결 초기화가 필요해요.",
   live_start_failed: "음성 세션을 시작하지 못했어요.",
   live_dropped: "음성 서버 연결이 끊어졌어요.",
+  live_unavailable: "음성 연결이 끊겨 다시 연결하지 못했어요. 다시 시작해 주세요.",
   live_error: "음성 서버 오류가 발생했어요.",
   question_speech_timeout: "질문을 읽지 못했어요. 화면을 확인해 주세요.",
   answer_on_screen: "화면에서 답해 주세요.",
+};
+
+const ERROR_DETAIL_KO: Record<string, string> = {
+  "bad token": "인증 토큰 불일치",
+  "another panel": "다른 패널 연결됨",
+  "another panel is already connected": "다른 패널 연결됨",
+  "invalid JSON": "형식 오류",
+  "send hello first": "초기화 필요",
+  "undecodable binary frame": "오디오 프레임 오류",
+  connect: "연결 실패",
+  invalid_value: "설정 거부",
+  cedar_rejected: "음성 설정 거부",
+  "Live connection dropped": "연결 끊김",
+  unknown: "알 수 없는 오류",
+  rate_limit: "요청 한도 초과",
+  server_error: "서버 오류",
+  invalid_request_error: "잘못된 요청",
+  moderation: "안전 정책 제한",
+};
+
+const TOOL_KO: Record<string, string> = {
+  bash: "명령 실행",
+  read: "파일 읽기",
+  edit: "파일 수정",
+  write: "파일 쓰기",
+  grep: "내용 검색",
+  glob: "파일 찾기",
+  eval: "코드 실행",
+  task: "작업 위임",
+  todo: "할 일 정리",
+  web_search: "웹 검색",
+  webfetch: "웹 문서 읽기",
+  memory: "기억 저장",
+  ask_user_question: "질문 확인",
+  voice_start: "음성 시작",
 };
 
 const REASON_KO: Record<string, string> = {
@@ -92,12 +128,70 @@ const REASON_KO: Record<string, string> = {
   closed: "연결 종료",
 };
 
+const GUARD_REASONS = new Set(["idle", "cap"]);
+
 /** Korean user-facing text for a bridge error; messages already in Korean pass through. */
 export function formatErrorKo(code: string, message: string): string {
   if (/[가-힣]/.test(message)) return message;
   const base = ERROR_KO[code];
-  if (base) return message && message !== code ? `${base} (${message})` : base;
-  return `오류가 발생했어요 (${code || message || "unknown"})`;
+  const detail = ERROR_DETAIL_KO[message] ?? ERROR_DETAIL_KO[code];
+  if (base) return detail ? `${base} (${detail})` : base;
+  return detail ? `오류가 발생했어요 (${detail})` : "오류가 발생했어요.";
+}
+
+export const QUESTION_HINT_KO = "질문은 OmO 화면에서 선택해 주세요.";
+
+/** True when the bridge WebSocket itself is disconnected and manual reconnect should be offered. */
+export function isBridgeDisconnected(s: Pick<PanelViewState, "connection" | "closeReason">): boolean {
+  return s.connection === "closed" && s.closeReason === "ws_closed";
+}
+
+/** True when the Live session closed due to an idle/cap guard and can be resumed from the panel. */
+export function isGuardClosed(s: Pick<PanelViewState, "connection" | "closeReason">): boolean {
+  return s.connection === "closed" && s.closeReason !== null && GUARD_REASONS.has(s.closeReason);
+}
+
+/** Control button enablement and primary hierarchy across live, guard-paused, and bridge-disconnected states. */
+export function controlButtonStates(s: Pick<PanelViewState, "connection" | "closeReason">): {
+  muteDisabled: boolean;
+  resumeDisabled: boolean;
+  resumePrimary: boolean;
+  stopDisabled: boolean;
+} {
+  const disconnected = isBridgeDisconnected(s);
+  const canResume = s.connection === "closed" && !disconnected;
+  return {
+    muteDisabled: s.connection !== "open",
+    resumeDisabled: !canResume,
+    resumePrimary: canResume,
+    stopDisabled: disconnected,
+  };
+}
+
+/** Label for the resume control, including cumulative cost when guard-closed or paused with recorded usage. */
+export function resumeButtonText(s: Pick<PanelViewState, "connection" | "closeReason" | "cumulativeMs" | "estimatedUsd">): string {
+  if (isGuardClosed(s) || (s.connection === "closed" && !isBridgeDisconnected(s) && s.cumulativeMs > 0)) {
+    return `재개 (${formatCost(s.cumulativeMs, s.estimatedUsd)})`;
+  }
+  return "재개";
+}
+
+/** Structured reason and cost segments for the guard-close banner so the cost segment can stay no-wrap. */
+export function guardCloseBannerParts(
+  s: Pick<PanelViewState, "connection" | "closeReason" | "cumulativeMs" | "estimatedUsd">,
+): { reason: string; cost: string } | null {
+  if (!isGuardClosed(s)) return null;
+  const why = s.closeReason ? REASON_KO[s.closeReason] ?? "일시정지" : "일시정지";
+  return {
+    reason: `${why}로 음성 세션이 일시정지되었어요 · `,
+    cost: `누적 ${formatCost(s.cumulativeMs, s.estimatedUsd)}`,
+  };
+}
+
+/** Korean summary banner when a guard closes the Live session, showing reason and cumulative cost so far. */
+export function guardCloseBannerText(s: Pick<PanelViewState, "connection" | "closeReason" | "cumulativeMs" | "estimatedUsd">): string {
+  const parts = guardCloseBannerParts(s);
+  return parts ? `${parts.reason}${parts.cost}` : "";
 }
 
 export function initialViewState(): PanelViewState {

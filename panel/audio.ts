@@ -94,7 +94,7 @@ export class PanelAudio {
 
   /** Loads both worklets and builds the playback graph. Never assumes a 48 kHz context. */
   static async create(ctx: AudioContext, opts: PanelAudioOptions): Promise<PanelAudio> {
-    if (!audioCapabilities().audioWorklet) throw new Error("이 브라우저는 AudioWorklet을 지원하지 않아요.");
+    if (!audioCapabilities().audioWorklet) throw new Error("이 브라우저는 실시간 오디오 처리를 지원하지 않아요.");
     const base = opts.workletBase ?? new URL("./worklets/", import.meta.url).href;
     await ctx.audioWorklet.addModule(new URL("capture.worklet.js", base).href);
     await ctx.audioWorklet.addModule(new URL("playback.worklet.js", base).href);
@@ -141,7 +141,7 @@ export class PanelAudio {
     const { qa, qaWav } = this.opts.qa;
     if (qa && opts.bridgeQa && qaWav) {
       const res = await fetch(qaWav);
-      if (!res.ok) throw new Error(`QA WAV ${qaWav}: HTTP ${res.status}`);
+      if (!res.ok) throw new Error(`샘플 오디오를 불러오지 못했어요 (${res.status})`);
       const buffer = await this.ctx.decodeAudioData(await res.arrayBuffer());
       const src = this.ctx.createBufferSource();
       src.buffer = buffer;

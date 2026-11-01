@@ -10,7 +10,7 @@ import {
   type PlaybackMsg,
 } from "../shared/protocol.ts";
 
-export const HANDSHAKE_REFUSED_KO = "브리지에 연결하지 못했어요. 인증 토큰이 올바르지 않거나(unauthorized) 브리지가 실행 중이 아니에요.";
+export const HANDSHAKE_REFUSED_KO = "브리지에 연결하지 못했어요. 인증 토큰이 올바르지 않거나 브리지가 실행 중이 아니에요.";
 
 export interface PcmFrame {
   generation: number;
