@@ -158,6 +158,9 @@ export const TRANSITIONS = [
     ])),
   row("utterance.message.idle", "utterance.committed", (s, e) => s.connection === "open" && s.agent === "idle" && e.kind === "message",
     s => changed(s, { agent: "submitting" }, [{ type: "forwardUtterance" }])),
+  row("utterance.message.busy", "utterance.committed", (s, e) => s.connection === "open" &&
+    (s.agent === "submitting" || s.agent === "working") && e.kind === "message",
+    s => ({ state: s, effects: [{ type: "forwardUtterance" }] })),
   row("utterance.answer.question", "utterance.committed", (s, e) => s.connection === "open" && s.agent === "question" && s.pendingQuestion !== null && e.kind === "answer",
     s => ({ state: s, effects: [{ type: "forwardUtterance" }] })),
   row("utterance.cancel.draft.busy", "utterance.committed", (s, e) => e.kind === "cancel" && !!s.draftHeld && busy(s), cancel),
