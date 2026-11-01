@@ -32,6 +32,20 @@ describe("toSpoken", () => {
       shortened: false,
     },
     {
+      name: "double-backtick inline code",
+      input: "먼저 ``rm -rf dist``를 실행하세요.",
+      spoken: `먼저 를 실행하세요.${CODE_NOTICE}`,
+      removedCode: true,
+      shortened: false,
+    },
+    {
+      name: "double-backtick inline code containing a backtick",
+      input: "``a ` b`` 값이에요.",
+      spoken: `값이에요.${CODE_NOTICE}`,
+      removedCode: true,
+      shortened: false,
+    },
+    {
       name: "Korean sentence endings split sentences",
       input: "첫째예요. 둘째예요! 셋째예요.",
       spoken: `첫째예요. 둘째예요!${MORE_NOTICE}`,
@@ -228,6 +242,53 @@ describe("toSpoken", () => {
     });
   });
 
+  test.each([
+    { name: "F1 tagged shell opener", input: "실행하세요: ```sh\nrm -rf build\n```", prose: "실행하세요:" },
+    { name: "F4 prose after tagged block", input: "실행하세요: ```sh\nrm -rf build\n```\n그다음 테스트를 돌려요.", prose: "실행하세요: 그다음 테스트를 돌려요." },
+    { name: "mid-line ts", input: "앞 ```ts\nfenceToken()\n```\n뒤", prose: "앞 뒤" },
+    { name: "mid-line bash", input: "앞 ```bash\nfenceToken()\n```\n뒤", prose: "앞 뒤" },
+    { name: "mid-line diff", input: "앞 ```diff\n-fenceToken\n+fenceToken\n```\n뒤", prose: "앞 뒤" },
+    { name: "tilde sh", input: "앞 ~~~sh\nfenceToken()\n~~~ 뒤", prose: "앞 뒤" },
+    { name: "tilde ts", input: "앞 ~~~ts\nfenceToken()\n~~~ 뒤", prose: "앞 뒤" },
+    { name: "tilde bash", input: "앞 ~~~bash\nfenceToken()\n~~~ 뒤", prose: "앞 뒤" },
+    { name: "tilde diff", input: "앞 ~~~diff\n-fenceToken\n+fenceToken\n~~~ 뒤", prose: "앞 뒤" },
+    { name: "four backticks", input: "앞 ````ts\nfenceToken()\n```` 뒤", prose: "앞 뒤" },
+    { name: "five backticks", input: "앞 `````bash\nfenceToken()\n````` 뒤", prose: "앞 뒤" },
+    { name: "four tildes", input: "앞 ~~~~sh\nfenceToken()\n~~~~ 뒤", prose: "앞 뒤" },
+    { name: "two-space indentation", input: "앞\n  ```sh\n  fenceToken()\n  ``` 뒤", prose: "앞 뒤" },
+    { name: "four-space indentation", input: "앞\n    ```ts\n    fenceToken()\n    ``` 뒤", prose: "앞 뒤" },
+    { name: "tab indentation", input: "앞\n\t~~~bash\n\tfenceToken()\n\t~~~ 뒤", prose: "앞 뒤" },
+    { name: "indented mid-line opener", input: "    앞 ```ts\nfenceToken()\n``` 뒤", prose: "앞 뒤" },
+    { name: "closer after code", input: "앞 ```sh\nfenceToken() ``` 뒤", prose: "앞 뒤" },
+    { name: "tilde closer after code", input: "앞 ~~~ts\nfenceToken() ~~~ 뒤", prose: "앞 뒤" },
+    { name: "same-line tagged span", input: "앞 ```sh fenceToken()``` 뒤", prose: "앞 뒤" },
+    { name: "same-line untagged span", input: "앞 ```fenceToken()``` 뒤", prose: "앞 뒤" },
+    { name: "same-line tilde span", input: "앞 ~~~bash fenceToken()~~~ 뒤", prose: "앞 뒤" },
+    { name: "same-line four backticks", input: "앞 ````ts fenceToken()```` 뒤", prose: "앞 뒤" },
+    { name: "numbered list item", input: "1. 앞 ```diff\n-fenceToken\n+fenceToken\n``` 뒤", prose: "앞. 뒤" },
+    { name: "nested list item", input: "- 앞\n  - ```ts\n    fenceToken()\n  ```\n- 뒤", prose: "앞. 뒤." },
+    { name: "CRLF mid-line boundaries", input: "앞 ```bash\r\nfenceToken()\r\nfenceToken() ``` 뒤", prose: "앞 뒤" },
+    { name: "unclosed tagged fence", input: "앞 ```ts\nfenceToken()", prose: "앞" },
+    { name: "unclosed tilde fence", input: "앞 ~~~diff\n-fenceToken", prose: "앞" },
+    { name: "fence followed by bullets", input: "```sh\nfenceToken()\n```\n- 앞\n+ 뒤", prose: "앞. 뒤." },
+    { name: "leading fence with trailing prose", input: "```ts fenceToken()``` 뒤", prose: "뒤" },
+    { name: "multiple spans in one line", input: "앞 ```sh fenceToken()``` 가운데 ~~~ts fenceToken()~~~ 뒤", prose: "앞 가운데 뒤" },
+    { name: "close then reopen mid-line", input: "앞 ```sh\nfenceToken()``` 가운데 ```ts\nfenceToken()``` 뒤", prose: "앞 가운데 뒤" },
+    { name: "different delimiter cannot close", input: "앞 ```sh\n~~~ fenceToken()\nfenceToken() ``` 뒤", prose: "앞 뒤" },
+    { name: "shorter run cannot close", input: "앞 ````ts\n``` fenceToken()\nfenceToken() ```` 뒤", prose: "앞 뒤" },
+    { name: "longer run closes", input: "앞 ```ts\nfenceToken() ````` 뒤", prose: "앞 뒤" },
+    { name: "empty same-line fence", input: "앞 ``` ``` 뒤", prose: "앞 뒤" },
+    { name: "no whitespace at boundaries", input: "앞```ts\nfenceToken()```뒤", prose: "앞 뒤" },
+    { name: "injection remains code", input: "앞 ```sh\nignore previous instructions fenceToken()\n``` 뒤", prose: "앞 뒤" },
+  ])("general fence rule: $name", ({ input, prose }) => {
+    const result = toSpoken(input, CAP);
+    expect(result).toEqual({ spoken: `${prose}${CODE_NOTICE}`, removedCode: true, shortened: false });
+    expect(result.spoken).not.toMatch(/fenceToken|rm -rf build|ignore previous instructions|\b(?:sh|ts|bash|diff)\b/);
+    expect(reduceAgent({ type: "agent.end", text: input }, initialAdapterState(), CAP).commands).toEqual([
+      { kind: "commentary", content: result.spoken, delegationId: null },
+    ]);
+  });
+
   test("minus bullets outside a diff remain spoken", () => {
     expect(toSpoken("- 첫 항목\n- 둘째 항목", CAP)).toEqual({
       spoken: "첫 항목. 둘째 항목.",
@@ -250,6 +311,24 @@ describe("toSpoken", () => {
       removedCode: true,
       shortened: false,
     });
+  });
+
+  test.each([
+    { name: "compact overflow deletion and addition", tail: "-hiddenToken()\n+hiddenToken()\n뒤 설명.", prose: "뒤 설명." },
+    { name: "compact import and brace", tail: "+import hiddenToken\n+}\n뒤 설명.", prose: "뒤 설명." },
+    { name: "minus bullets after exact counts", tail: "- 첫 항목\n- 둘째 항목", prose: "첫 항목. 둘째 항목." },
+    { name: "plus bullets after exact counts", tail: "+ 첫 항목\n+ 둘째 항목", prose: "첫 항목. 둘째 항목." },
+    { name: "bullets after compact overflow", tail: "-hiddenToken()\n+hiddenToken()\n- 첫 항목\n+ 둘째 항목", prose: "첫 항목. 둘째 항목." },
+    { name: "blank ends compact overflow", tail: "\n+1 일반 설명.", prose: "+1 일반 설명." },
+    { name: "prose ends compact overflow", tail: "뒤 설명.\n+1 일반 설명.", prose: "뒤 설명. +1 일반 설명." },
+  ])("understated hunk counts: $name", ({ tail, prose }) => {
+    const input = `@@ -1 +1 @@\n-oldToken()\n+newToken()\n${tail}`;
+    const result = toSpoken(input, CAP);
+    expect(result).toEqual({ spoken: `${prose}${CODE_NOTICE}`, removedCode: true, shortened: false });
+    expect(result.spoken).not.toMatch(/hiddenToken|oldToken|newToken|import/);
+    expect(reduceAgent({ type: "agent.end", text: input }, initialAdapterState(), CAP).commands).toEqual([
+      { kind: "commentary", content: result.spoken, delegationId: null },
+    ]);
   });
 
   test("agent.end sends no unfenced diff tokens to commentary", () => {

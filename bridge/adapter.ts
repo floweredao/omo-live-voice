@@ -22,7 +22,7 @@ interface Cleaned {
 function cleanMarkdown(text: string): Cleaned {
   let removedCode = false;
   let removedTable = false;
-  let inFence = false;
+  let fence: string | null = null;
   let prevBlank = true;
   let prevCode = false;
   const lines: string[] = [];
@@ -34,25 +34,29 @@ function cleanMarkdown(text: string): Cleaned {
 
   for (const [i, raw] of rawLines.entries()) {
     let t = raw.trim();
-    const fence = /^(`{3,}|~{3,})/.exec(t);
-    if (fence) {
-      inFence = !inFence;
+    let hadFence = fence !== null;
+    let prose = "";
+    let start = 0;
+    // Any run opens code; only the same delimiter, at least as long, closes it.
+    for (const match of t.matchAll(/`{3,}|~{3,}/g)) {
+      const run = match[0];
+      if (fence === null) {
+        prose += t.slice(start, match.index);
+        fence = run;
+      } else if (run[0] === fence[0] && run.length >= fence.length) {
+        fence = null;
+        prose += " ";
+      }
+      start = match.index + run.length;
       removedCode = true;
+      hadFence = true;
+    }
+    if (fence === null) prose += t.slice(start);
+    t = prose.trim();
+    if (hadFence && t === "") {
       prevCode = true;
       prevBlank = false;
-      if (inFence) continue;
-      t = t.slice(fence[0].length).trim();
-      if (t === "") continue;
-    }
-    if (inFence) {
-      removedCode = true;
       continue;
-    }
-    const trailingFence = /(`{3,}|~{3,})$/.exec(t);
-    if (trailingFence && !t.slice(0, trailingFence.index).includes(trailingFence[0])) {
-      inFence = true;
-      removedCode = true;
-      t = t.slice(0, trailingFence.index).trimEnd();
     }
     const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(t);
     if (t.startsWith("diff --git ") || t.startsWith("@@ ") ||
@@ -78,6 +82,11 @@ function cleanMarkdown(text: string): Cleaned {
         if (line[0] !== "-") newLeft--;
         continue;
       }
+      // Understated counts may leave compact code lines, but not spaced bullets.
+      if (oldLeft === 0 && newLeft === 0 && /^[+\-]\S/.test(line)) {
+        removedCode = true;
+        continue;
+      }
       inDiff = false;
     }
     if (t === "") {
@@ -86,7 +95,7 @@ function cleanMarkdown(text: string): Cleaned {
       prevCode = false;
       continue;
     }
-    if ((raw.startsWith("    ") || raw.startsWith("\t")) && (prevBlank || prevCode)) {
+    if (!hadFence && (raw.startsWith("    ") || raw.startsWith("\t")) && (prevBlank || prevCode)) {
       removedCode = true;
       prevCode = true;
       prevBlank = false;
@@ -99,8 +108,8 @@ function cleanMarkdown(text: string): Cleaned {
       continue;
     }
 
-    let line = t;
-    line = line.replace(/`[^`\n]*`/g, () => {
+    let line = hadFence ? prose.trimStart() : t;
+    line = line.replace(/(?<!`)(`+)(?!`)(.*?[^`])\1(?!`)/g, () => {
       removedCode = true;
       return "";
     });
