@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "types": [
+      "bun-types"
+    ],
+    "lib": [
+      "ESNext",
+      "DOM"
+    ]
+  },
+  "include": [
+    "shared",
+    "test",
+    "scripts",
+    "extension",
+    "bridge",
+    "panel"
+  ]
+}

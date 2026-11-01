@@ -1,0 +1,17 @@
+{
+  "name": "omo-live-voice",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit -p tsconfig.json",
+    "build:panel": "bun scripts/build-panel.ts",
+    "bridge": "bun bridge/main.ts",
+    "fixtures": "bash scripts/qa/make-fixtures.sh"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "@types/bun": "latest",
+    "@earendil-works/pi-coding-agent": "^1.4.0"
+  }
+}
