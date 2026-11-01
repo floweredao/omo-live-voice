@@ -35,6 +35,8 @@ const examples: Record<(typeof TRANSITIONS)[number]["name"], Example> = {
     patch: { pendingDelegationId: "item_1", waitCueSent: false, waitCueStarted: false }, effects: ["startTimer", "startTimer"] },
   "utterance.message.idle": { event: { type: "utterance.committed", kind: "message" }, patch: { agent: "submitting" },
     effects: ["forwardUtterance"] },
+  "utterance.message.busy": { given: { agent: "working" }, event: { type: "utterance.committed", kind: "message" },
+    patch: {}, effects: ["forwardUtterance"] },
   "utterance.answer.question": { given: { agent: "question", pendingQuestion: question },
     event: { type: "utterance.committed", kind: "answer" }, patch: {}, effects: ["forwardUtterance"] },
   "utterance.cancel.draft.busy": { given: { agent: "working", draftHeld: true },
@@ -140,6 +142,31 @@ function trace(state: Axes, events: readonly Event[]) {
 }
 
 describe("interleavings", () => {
+  test("busy messages forward without changing submitting or working state", () => {
+    // Given: either busy state, with the existing run latches retained.
+    for (const agent of ["submitting", "working"] as const) {
+      const state: Axes = { ...INITIAL_STATE, connection: "open", agent,
+        pendingDelegationId: "follow-up", waitCueStarted: true, waitCueSent: true };
+      // When
+      const result = transition(state, { type: "utterance.committed", kind: "message" });
+      // Then
+      expect(result).toEqual({ state, effects: [{ type: "forwardUtterance" }] });
+      expect(result.state).toBe(state);
+    }
+  });
+
+  test("messages remain held while questioning cancelling or disconnected", () => {
+    // Given
+    for (const patch of [
+      { agent: "question", pendingQuestion: question }, { agent: "cancelling" },
+      { connection: "closed", agent: "working" }, { connection: "connecting", agent: "submitting" },
+    ] satisfies Partial<Axes>[]) {
+      const state: Axes = { ...INITIAL_STATE, connection: "open", ...patch };
+      // When / Then
+      expect(transition(state, { type: "utterance.committed", kind: "message" })).toEqual({ state, effects: [] });
+    }
+  });
+
   test("a: barge-in during commentary then agent.end sends exactly one commentary and never aborts", () => {
     const state: Axes = { ...INITIAL_STATE, connection: "open", agent: "working" };
     const result = trace(state, [

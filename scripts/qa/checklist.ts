@@ -11,6 +11,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { questionToSpeech, INSTRUCTIONS_PREFIX } from "../../bridge/adapter.ts";
 import { norm, orderedMatch } from "../../bridge/question-transcript.ts";
+import { encodeFrame, MAX_FRAME_SAMPLES, type BridgeToPanel } from "../../shared/protocol.ts";
 
 /** Reject numbered alternatives even when all required labels also occur later. */
 export function inventedOptions(text: string, labels: readonly string[]): readonly string[] {
@@ -555,7 +556,7 @@ items.l = {
 
 type B = { h: ProcH; frames: { t: number; f: any }[]; send: (o: object) => void; data: string; capture: string; extLog: () => string; seq: number };
 let rpcSeq = 0;
-async function startB(ctx: Ctx, name: string, env: Record<string, string> = {}, data = join(ctx.tmp, "data")): Promise<B> {
+async function startB(ctx: Ctx, name: string, env: Record<string, string> = {}, data = join(ctx.tmp, "data"), extensionFile?: string): Promise<B> {
   const le = await liveEnv();
   const wrapper = join(ctx.tmp, "bun-tap.sh");
   if (!existsSync(wrapper)) {
@@ -573,7 +574,7 @@ async function startB(ctx: Ctx, name: string, env: Record<string, string> = {}, 
   delete childEnv.OMO_RPC_CLIENT_CAPABILITIES;
   if (!FAKE) delete childEnv.OPENAI_API_KEY;
   const b: B = { h: null as unknown as ProcH, frames: [], send: () => {}, data, capture, seq: 0, extLog: () => "" };
-  b.h = ctx.spawn(`omo-${name}`, [OMO, "--mode", "rpc", "--no-session"], {
+  b.h = ctx.spawn(`omo-${name}`, [OMO, "--mode", "rpc", "--no-session", ...(extensionFile ? ["--no-extensions", "-e", extensionFile] : [])], {
     cwd: work,
     env: childEnv,
     onOut: (l) => {
@@ -760,27 +761,97 @@ items.j = {
   group: "B",
   title: "IS-2 busy latency: delegation.created -> input_admitted steer <= 2000 ms (visible time recorded)",
   run: async (ctx) => {
-    const b = await startB(ctx, "j");
+    const b = await startB(ctx, "j", {}, join(ctx.tmp, "data"), FAKE ? `${ROOT}extension/index.ts` : undefined);
     const panel = await voiceOn(ctx, b);
-    const at = b.frames.length;
-    b.send({ id: `chk-${++rpcSeq}`, type: "prompt", message: COUNT_PROMPT });
-    if (!(await ctx.until(() => b.frames.slice(at).some((x) => x.f.type === "agent_start"), 60_000))) throw new Error("no agent_start");
-    startPanel(ctx, panel.port, panel.token, ["--inject-at", "3000", `${ROOT}fixtures/ko-list-files.wav`, "--tail-ms", "6000", "--linger-ms", "60000"]);
-    await ctx.until(() => /input_admitted \S+ \d+ \S+/.test(b.extLog()) || ctx.log.some((l) => l.includes("utterance_dropped_busy")), 45_000);
-    const del = ctx.tapsOf("live_recv", "session.delegation.created")[0];
-    const adm = /input_admitted (\S+) (\d+) (\S+)/.exec(b.extLog());
-    const admT = adm ? Number(adm[2]) : NaN;
-    const dropped = ctx.log.some((l) => l.includes("utterance_dropped_busy"));
-    await ctx.until(() => !!userMessageFrame(b, "파일", del?.t ?? 0), 30_000);
-    const vis = userMessageFrame(b, "파일", del?.t ?? 0);
-    ctx.numbers.delegationToInputAdmittedMs = del && adm ? admT - del.t : null;
-    ctx.numbers.admittedAs = adm?.[3] ?? null;
-    ctx.numbers.delegationToUserMessageVisibleMs = del && vis ? vis.t - del.t : null;
-    ctx.numbers.utteranceDroppedBusy = dropped;
-    b.send({ id: `chk-${++rpcSeq}`, type: "abort" });
-    await ctx.until(() => b.frames.some((x) => x.t > Date.now() - 100 && x.f.type === "agent_end"), 15_000);
-    const ok = !!del && !!adm && adm[3] === "steer" && admT - del.t <= 2_000;
-    return { ok, detail: `delegation.created->input_admitted(${adm?.[3] ?? "none"})=${ctx.numbers.delegationToInputAdmittedMs}ms; visible user message after ${ctx.numbers.delegationToUserMessageVisibleMs}ms (recorded); utterance_dropped_busy=${dropped}` };
+    // Keep one panel connected throughout: audio is queued only after the bridge's
+    // own working state arrives, not at a guessed offset from agent_start.
+    const ws = new WebSocket(`ws://127.0.0.1:${panel.port}/ws?token=${panel.token}`, {
+      headers: { Origin: `http://127.0.0.1:${panel.port}` },
+    } as never);
+    let seq = 0;
+    let frame = 0;
+    let audio: Buffer | undefined;
+    let audioOffset = 0;
+    const send = (msg: object) => ws.send(JSON.stringify({ v: 1, seq: ++seq, ...msg }));
+    ws.addEventListener("open", () => {
+      send({ type: "hello", token: panel.token, capabilities: { audioWorklet: true, setSinkId: false }, sampleRate: 24000 });
+    });
+    ws.addEventListener("message", (event) => {
+      if (typeof event.data !== "string") return;
+      const msg: BridgeToPanel = JSON.parse(event.data);
+      if (msg.type === "flush") send({ type: "playback", flushAck: msg.generation });
+    });
+    // This timer paces microphone frames; it is not a readiness or busy-state wait.
+    const mic = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const pcm = new Int16Array(MAX_FRAME_SAMPLES);
+      for (let i = 0; audio && i < pcm.length && audioOffset + 2 <= audio.length; i++, audioOffset += 2) {
+        pcm[i] = audio.readInt16LE(audioOffset);
+      }
+      ws.send(encodeFrame(0, frame++, pcm));
+    }, 100);
+    try {
+      if (!(await ctx.until(() => extStates(ctx).some((x) => x.msg.connection === "open"), 20_000))) throw new Error("bridge never opened before first utterance");
+      const at = b.frames.length;
+      const firstAt = Date.now();
+      const workingEvent = ctx.until(() => extStates(ctx).some((x) => x.t >= firstAt && x.msg.agent === "working"), 60_000);
+      b.send({ id: `chk-${++rpcSeq}`, type: "prompt", message: COUNT_PROMPT });
+      if (!(await workingEvent)) throw new Error("bridge never reported agent=working after first utterance");
+      const working = extStates(ctx).find((x) => x.t >= firstAt && x.msg.agent === "working");
+      if (extStates(ctx).at(-1)?.msg.agent !== "working") throw new Error("agent stopped working before audio injection");
+      const wav = readFileSync(`${ROOT}fixtures/ko-list-files.wav`);
+      let data: Buffer | undefined;
+      for (let offset = 12; offset + 8 <= wav.length;) {
+        const size = wav.readUInt32LE(offset + 4);
+        if (wav.toString("ascii", offset, offset + 4) === "data") {
+          data = wav.subarray(offset + 8, offset + 8 + size);
+          break;
+        }
+        offset += 8 + size + (size & 1);
+      }
+      if (!data?.length) throw new Error("voice fixture has no PCM data");
+      const injectAt = Date.now();
+      ctx.note("item-j", "injecting second utterance after bridge agent=working");
+      audio = data;
+      const delegated = () => ctx.tapsOf("live_recv", "session.delegation.created").find((x) => x.t >= injectAt);
+      if (!(await ctx.until(() => !!delegated(), 45_000))) throw new Error("second utterance was not delegated");
+      const del = delegated();
+      if (!del) throw new Error("second delegation disappeared");
+      const stateAtDelegation = extStates(ctx).filter((x) => x.t <= del.t).at(-1)?.msg.agent;
+      const utterance = () => ctx.tapsOf("ext_out").find((x) => x.t >= del.t && x.msg?.type === "utterance" && x.msg.kind === "message");
+      await ctx.until(() => !!utterance() || ctx.log.some((l) => /utterance_(?:dropped_busy|not_forwarded)/.test(l)), 5_000);
+      const u = utterance();
+      const admitted = () => [...b.extLog().matchAll(/input_admitted (\S+) (\d+) (\S+)/g)]
+        .find((m) => m[1] === u?.msg.id && Number(m[2]) >= del.t);
+      if (u) await ctx.until(() => !!admitted(), 5_000);
+      const adm = admitted();
+      const admT = adm ? Number(adm[2]) : NaN;
+      const dropped = ctx.log.some((l) => /utterance_(?:dropped_busy|not_forwarded)/.test(l));
+      await ctx.until(() => !!userMessageFrame(b, "파일", del.t), 30_000);
+      const vis = userMessageFrame(b, "파일", del.t);
+      Object.assign(ctx.numbers, {
+        firstUtterance: COUNT_PROMPT, firstUtteranceAt: firstAt,
+        firstUtteranceVisible: !!userMessageFrame(b, COUNT_PROMPT, firstAt),
+        bridgeWorkingAt: working?.t ?? null, secondInjectedAt: injectAt,
+        bridgeAgentAtDelegation: stateAtDelegation, secondDelegationId: del.id,
+        secondUtteranceId: u?.msg.id ?? null,
+        delegationToInputAdmittedMs: del && adm ? admT - del.t : null,
+        admittedAs: adm?.[3] ?? null,
+        delegationToUserMessageVisibleMs: vis ? vis.t - del.t : null,
+        utteranceDroppedBusy: dropped,
+      });
+      const abortAt = b.frames.length;
+      b.send({ id: `chk-${++rpcSeq}`, type: "abort" });
+      await ctx.until(() => b.frames.slice(abortAt).some((x) => x.f.type === "agent_end") ||
+        b.frames.slice(at).some((x) => x.f.type === "agent_end"), 15_000);
+      const ok = !!working && working.t >= firstAt && injectAt >= working.t &&
+        ctx.numbers.firstUtteranceVisible === true && stateAtDelegation === "working" &&
+        !!u && !!adm && adm[3] === "steer" && admT - del.t >= 0 && admT - del.t <= 2_000 && !dropped;
+      return { ok, detail: `bridge working before injection=${!!working && injectAt >= working.t}; agent at delegation=${stateAtDelegation}; delegation.created->input_admitted(${adm?.[3] ?? "none"})=${ctx.numbers.delegationToInputAdmittedMs}ms; visible user message after ${ctx.numbers.delegationToUserMessageVisibleMs}ms (recorded); utterance_dropped_busy=${dropped}` };
+    } finally {
+      clearInterval(mic);
+      ws.close();
+    }
   },
 };
 

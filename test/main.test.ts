@@ -235,6 +235,112 @@ const CHUNK_QUESTION = {
   options: Array.from({ length: 8 }, (_, i) => ({ label: `${i + 1} ${"가".repeat(78)}` })),
 };
 
+describe("P6 bridge regressions", () => {
+  for (const agent of ["submitting", "working"] as const) {
+    test(`forwards a second delegation exactly once while ${agent}`, async () => {
+      // Given: a voice message starts the run before the follow-up arrives.
+      const h = await regressionBridge();
+      await h.delta("목록 보여줘", 0, 1000);
+      const first = h.bridge.nextJson("utterance", 2000);
+      h.live.emit({ type: "session.delegation.created", offset_ms: 1000, delegation: { id: "first" } });
+      await h.syncLive();
+      await h.clock(600);
+      expect(await first).toMatchObject({ kind: "message", text: "목록 보여줘" });
+      if (agent === "working") {
+        h.bridge.send({ type: "agent.idle", idle: false });
+        h.bridge.send({ type: "agent.tool.start", name: "count" });
+        await h.barrier();
+      }
+      expect(await h.bridge.nextJson("state", 2000, (m) => m.agent === agent)).toMatchObject({ agent });
+      // When: another delegation settles while the run is still busy.
+      await h.delta("테스트도 돌려줘", 2000, 3000);
+      const second = h.bridge.nextJson("utterance", 2000, (m) => m.text === "테스트도 돌려줘");
+      h.live.emit({ type: "session.delegation.created", offset_ms: 3000, delegation: { id: "second" } });
+      await h.syncLive();
+      await h.clock(1200);
+      // Then: the extension link gets one message without regressing the agent axis.
+      expect(await second).toMatchObject({ kind: "message", text: "테스트도 돌려줘" });
+      await h.clock(1300);
+      await h.syncLive();
+      const records = h.bridge.stdout.map((line) => JSON.parse(line));
+      expect(records.filter((m) => m.type === "utterance" && m.text === "테스트도 돌려줘")).toHaveLength(1);
+      expect(records.filter((m) => m.type === "state").at(-1)).toMatchObject({ agent });
+      h.bridge.send({ type: "stop" });
+      expect(await bounded(h.bridge.proc.exited, 3000, "busy steer exit")).toBe(0);
+    });
+  }
+
+  test("reports an unforwarded message while cancellation is pending", async () => {
+    // Given: an agent cancellation has not yet been acknowledged.
+    const h = await regressionBridge();
+    h.bridge.send({ type: "agent.idle", idle: false });
+    await h.barrier();
+    await h.delta("그만", 0, 200);
+    const cancel = h.bridge.nextJson("utterance", 2000, (m) => m.kind === "cancel");
+    await h.clock(600);
+    await cancel;
+    // When: another delegated message settles before cancellation completes.
+    await h.delta("테스트도 돌려줘", 2000, 3000);
+    const notice = h.nextPanel((m) => m.type === "error" && m.code === "utterance_not_forwarded");
+    const warning = h.bridge.nextJson("log", 2000, (m) =>
+      m.level === "warn" && m.msg === "utterance_not_forwarded agent=cancelling connection=open");
+    h.live.emit({ type: "session.delegation.created", offset_ms: 3000, delegation: { id: "cancelling-follow-up" } });
+    await h.syncLive();
+    await h.clock(1200);
+    // Then: cancellation semantics stay intact, but the undelivered request is visible.
+    expect(await notice).toMatchObject({ recoverable: true });
+    await warning;
+    expect(h.bridge.stdout.map((line) => JSON.parse(line)).filter((m) => m.type === "utterance")).toHaveLength(1);
+    h.bridge.send({ type: "stop" });
+    expect(await bounded(h.bridge.proc.exited, 3000, "cancelling message exit")).toBe(0);
+  });
+
+  test("ignores malformed devices envelopes and keeps answering panel controls", async () => {
+    // Given: an authenticated panel has persisted valid device labels.
+    const h = await regressionBridge();
+    const valid = {
+      type: "devices",
+      inputs: [{ id: "mic", label: "Microphone" }],
+      outputs: [{ id: "speaker", label: "Speaker" }],
+      selected: { input: "mic", output: "speaker" },
+    };
+    h.send(valid);
+    const saved = h.nextPanel((m) => m.type === "state" && m.muted);
+    h.send({ type: "control", action: "mute" });
+    await saved;
+    const settings = readFileSync(join(h.bridge.dataDir, "settings.json"), "utf8");
+    const malformed = [
+      { inputs: "x", outputs: 5 },
+      { inputs: null },
+      { outputs: {} },
+      { inputs: [null] },
+      { outputs: [{ id: "speaker", label: 5 }] },
+      { inputs: [{ label: "missing id" }] },
+      { selected: null },
+      { selected: { input: 5 } },
+      { selected: [] },
+    ];
+    // When: malformed list and element shapes arrive on the same panel socket.
+    for (const [i, bad] of malformed.entries()) {
+      const from = h.bridge.stdout.length;
+      const warned = h.bridge.nextJson("log", 2000, (m) =>
+        m.level === "warn" && m.msg === "devices_invalid" &&
+        h.bridge.stdout.slice(from).some((line) => JSON.parse(line).msg === "devices_invalid"));
+      h.send({ ...valid, ...bad });
+      expect(await warned).toMatchObject({ level: "warn", msg: "devices_invalid" });
+      // Then: an ordered panel round trip still answers and saved settings survive.
+      const muted = i % 2 !== 0;
+      const answered = h.nextPanel((m) => m.type === "state" && m.muted === muted);
+      h.send({ type: "control", action: muted ? "mute" : "unmute" });
+      expect(await answered).toMatchObject({ connection: "open", muted });
+      expect(readFileSync(join(h.bridge.dataDir, "settings.json"), "utf8")).toBe(settings);
+    }
+    expect(h.bridge.stdout.map((line) => JSON.parse(line)).filter((m) => m.msg === "devices_invalid")).toHaveLength(malformed.length);
+    h.bridge.send({ type: "stop" });
+    expect(await bounded(h.bridge.proc.exited, 3000, "malformed devices exit")).toBe(0);
+  });
+});
+
 describe("P3 question chunks", () => {
   test("transcript deltas hold the next chunk until both streams are quiet", async () => {
     // Given: the current chunk has voiced PCM, followed by continuing transcript deltas.

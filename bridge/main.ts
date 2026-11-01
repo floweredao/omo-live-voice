@@ -168,9 +168,19 @@ function loadSettings(): Settings {
 }
 
 function saveDevices(msg: DevicesMsg): void {
+  const validList = (list: unknown): list is DevicesMsg["inputs"] => Array.isArray(list) &&
+    list.every((device: unknown) => typeof device === "object" && device !== null &&
+      "id" in device && typeof device.id === "string" && "label" in device && typeof device.label === "string");
+  if (!validList(msg.inputs) || !validList(msg.outputs) ||
+    typeof msg.selected !== "object" || msg.selected === null || Array.isArray(msg.selected) ||
+    (msg.selected.input !== undefined && typeof msg.selected.input !== "string") ||
+    (msg.selected.output !== undefined && typeof msg.selected.output !== "string")) {
+    log("warn", "devices_invalid");
+    return;
+  }
   const label = (list: { id: string; label: string }[], id?: string) => (id === undefined ? undefined : list.find((d) => d.id === id)?.label);
-  const input = label(msg.inputs ?? [], msg.selected?.input);
-  const output = label(msg.outputs ?? [], msg.selected?.output);
+  const input = label(msg.inputs, msg.selected.input);
+  const output = label(msg.outputs, msg.selected.output);
   const devices = { ...loadSettings().devices, ...(input ? { input } : {}), ...(output ? { output } : {}) };
   try {
     mkdirSync(DATA_DIR, { recursive: true });
@@ -402,10 +412,10 @@ function settleUtterance(offsetMs: number, delegationId: string | null): void {
 
 function commitMessage(text: string): void {
   pending = { text, kind: "message" };
-  const before = state.agent;
   dispatch({ type: "utterance.committed", kind: "message" });
-  if (pending && before !== "idle") {
-    log("info", `utterance_dropped_busy agent=${before}`);
+  if (pending) {
+    log("warn", `utterance_not_forwarded agent=${state.agent} connection=${state.connection}`);
+    panel?.send({ type: "error", code: "utterance_not_forwarded", message: "요청을 전달하지 못했어요. 잠시 후 다시 말해 주세요.", recoverable: true });
     pending = null;
   }
 }
