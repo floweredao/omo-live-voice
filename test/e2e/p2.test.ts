@@ -447,7 +447,8 @@ test("(8) headless omo rpc: /voice -> setStatus, spoken WAV -> user message + as
   const port = probe.port;
   probe.stop(true);
   const token = "e2e".padEnd(64, "0");
-  const omo = Bun.spawn([OMO, "--mode", "rpc", "--no-session", "--no-extensions", "-e", join(R, "extension/index.ts")], {
+  // Keep the throwaway cwd independent of the user's memory identity and sync configuration.
+  const omo = Bun.spawn([OMO, "--mode", "rpc", "--no-session", "--no-extensions", "--omo-senpi-memory-disabled", "-e", join(R, "extension/index.ts")], {
     cwd: dir,
     stdin: "pipe",
     stdout: "pipe",
