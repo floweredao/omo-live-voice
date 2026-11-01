@@ -99,12 +99,25 @@ function lastAssistantText(messages: unknown): string {
 }
 
 function statusLabel(s: StateMsg): string {
-  if (s.muted || s.connection === "closed") return "🎙 일시정지";
+  if (s.connection === "closed") return "⏸ 일시정지";
+  if (s.muted) return "🔇 무음";
   if (s.connection === "connecting") return "🎙 음성 연결 중";
-  if (s.output === "speaking") return "🎙 말하는 중";
-  if (s.agent !== "idle") return "🎙 에이전트 작업 중";
+  if (s.output === "speaking") return "🔊 말하는 중";
+  if (s.agent !== "idle") return "🤖 에이전트 작업 중";
   return "🎙 듣는 중";
 }
+
+const EXIT_REASONS: Record<string, { text: string; type: "info" | "warning" | "error" }> = {
+  cedar_rejected: { text: "GPT-Live가 cedar 보이스를 거절했어요. 관리자에게 알려 주세요.", type: "error" },
+  key_missing: { text: "Keychain에 키가 없어요: scripts/set-key.sh", type: "error" },
+  budget: { text: "사용 한도(예산)에 도달해 음성을 종료했어요", type: "warning" },
+  cap: { text: "음성 세션 시간 한도에 도달해 종료했어요", type: "warning" },
+  idle: { text: "한동안 조용해서 음성을 종료했어요", type: "info" },
+  stop: { text: "음성 종료", type: "info" },
+};
+
+/** Budget for the whole session_shutdown handler; the host allows ~2 s. */
+const SHUTDOWN_BUDGET_MS = 1500;
 
 function toOptions(raw: unknown): QuestionOption[] {
   if (!Array.isArray(raw)) return [];
@@ -119,6 +132,7 @@ export default function omoLiveVoice(pi: ExtensionAPI): void {
   try {
     let child: ChildProcess | null = null;
     let childSessionId: string | null = null;
+    let childTitle: string | null = null;
     let ctxRef: ExtensionContext | null = null;
     let logFile: string | null = null;
     let openOnReady: PanelHost | null = null;
@@ -217,7 +231,10 @@ export default function omoLiveVoice(pi: ExtensionAPI): void {
           return;
         case "exit":
           extLog(`bridge_exit ${msg.reason}`);
-          if (!stopping) notify(`음성 종료: ${msg.reason}`, "info");
+          if (!stopping) {
+            const known = EXIT_REASONS[msg.reason];
+            notify(known ? known.text : `음성 종료: ${msg.reason}`, known?.type ?? "info");
+          }
           stopping = true;
           return;
       }
@@ -228,6 +245,7 @@ export default function omoLiveVoice(pi: ExtensionAPI): void {
       fallbackTimer = null;
       child = null;
       childSessionId = null;
+      childTitle = null;
       openOnReady = null;
       pending.length = 0;
       removeLockIfOwned(pid);
@@ -255,7 +273,7 @@ export default function omoLiveVoice(pi: ExtensionAPI): void {
         notify("음성 재개", "info");
         return "resumed";
       }
-      const owner = child ? { sessionId: childSessionId, title: null } : lock;
+      const owner = child ? { sessionId: childSessionId, title: childTitle } : lock;
       if (owner && owner.sessionId !== sessionId) {
         notify(`이미 다른 세션(${owner.title || owner.sessionId})에 연결됨. 그곳에서 /voice stop 실행`, "warning");
         return "refused_other_session";
@@ -277,6 +295,7 @@ export default function omoLiveVoice(pi: ExtensionAPI): void {
       const proc = spawn(bun, [bridgeMain], { stdio: ["pipe", "pipe", "inherit"], env: { ...process.env }, cwd: ctx.cwd });
       child = proc;
       childSessionId = sessionId;
+      childTitle = title;
       openOnReady = host;
       extLog(`spawn pid=${proc.pid} bun=${bun}`);
 
@@ -314,7 +333,7 @@ export default function omoLiveVoice(pi: ExtensionAPI): void {
       return "started";
     };
 
-    const stop = async (ctx: ExtensionContext | null, signal?: AbortSignal): Promise<string> => {
+    const stop = async (ctx: ExtensionContext | null, signal?: AbortSignal, budgetMs = Infinity): Promise<string> => {
       if (ctx) ctxRef = ctx;
       const proc = child;
       if (!proc) {
@@ -340,14 +359,20 @@ export default function omoLiveVoice(pi: ExtensionAPI): void {
       const timedOut = await Promise.race([
         exited.then(() => false),
         new Promise<boolean>((resolve) => {
-          timer = setTimeout(() => resolve(true), stopTimeoutMs());
-          signal?.addEventListener("abort", () => resolve(true), { once: true });
+          timer = setTimeout(() => resolve(true), Math.min(stopTimeoutMs(), budgetMs));
+          if (signal?.aborted) resolve(true);
+          else signal?.addEventListener("abort", () => resolve(true), { once: true });
         }),
       ]);
       clearTimeout(timer);
       if (timedOut && child === proc) {
         extLog("stop_timeout sigterm");
         proc.kill("SIGTERM");
+        setTimeout(() => {
+          try {
+            if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+          } catch {}
+        }, 300).unref();
         cleanup(proc.pid);
       }
       notify("음성 종료", "info");
@@ -439,7 +464,7 @@ export default function omoLiveVoice(pi: ExtensionAPI): void {
     });
     pi.on("session_shutdown", async (event, ctx) => {
       if (!child) return;
-      await stop(ctx, (event as { signal?: AbortSignal }).signal);
+      await stop(ctx, (event as { signal?: AbortSignal }).signal, SHUTDOWN_BUDGET_MS);
     });
 
     pi.events.on("ask-user:asked", (payload) => {

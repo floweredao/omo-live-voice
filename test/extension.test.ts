@@ -422,6 +422,110 @@ describe("/voice lifecycle", () => {
   });
 });
 
+function exitingBridge(reason: string): string {
+  const path = join(dir, `exit-${reason}.sh`);
+  writeFileSync(
+    path,
+    `#!/bin/bash\nread -r line\nprintf '%s\\n' '{"type":"ready","port":1,"token":"t","panelUrl":"http://127.0.0.1:1/"}'\nprintf '%s\\n' '{"type":"exit","reason":"${reason}"}'\nexit 0\n`,
+    { mode: 0o755 },
+  );
+  return path;
+}
+
+describe("polish", () => {
+  test("state frames map to the five Korean status texts", async () => {
+    const st = (o: object) => ({ type: "state", connection: "open", input: "quiet", agent: "idle", output: "idle", muted: false, ...o });
+    script(
+      st({}),
+      st({ output: "speaking" }),
+      st({ agent: "running" }),
+      st({ connection: "closed" }),
+      st({ muted: true }),
+    );
+    const { pi, ctx } = setup();
+    await startVoice(pi, ctx);
+    await waitFor(() => ctx.statuses.some((s) => s.text === "🔇 무음"), 5000, "mute status");
+    const texts = ctx.statuses.map((s) => s.text);
+    for (const t of ["🎙 듣는 중", "🔊 말하는 중", "🤖 에이전트 작업 중", "⏸ 일시정지", "🔇 무음"]) expect(texts).toContain(t);
+  });
+
+  test("bridge exit cedar_rejected notifies a cedar message and removes the lock", async () => {
+    process.env.OLV_BUN = exitingBridge("cedar_rejected");
+    const { pi, ctx } = setup();
+    await pi.run("", ctx);
+    await waitFor(() => ctx.notifies.some((n) => n.msg.includes("cedar")), 5000, "cedar notify");
+    await waitFor(() => !existsSync(lockFile()) && ctx.statuses.at(-1)?.text === "", 5000, "lock removed");
+    const n = ctx.notifies.find((x) => x.msg.includes("cedar"))!;
+    expect(n).toEqual({ msg: "GPT-Live가 cedar 보이스를 거절했어요. 관리자에게 알려 주세요.", type: "error" });
+  });
+
+  test("bridge exit reasons key_missing, budget, cap, idle each get a Korean notice", async () => {
+    const expected: Record<string, string> = {
+      key_missing: "Keychain에 키가 없어요: scripts/set-key.sh",
+      budget: "예산",
+      cap: "한도",
+      idle: "조용",
+    };
+    for (const [reason, frag] of Object.entries(expected)) {
+      process.env.OLV_BUN = exitingBridge(reason);
+      const { pi, ctx } = setup(`/sessions/s-${reason}.jsonl`);
+      await pi.run("", ctx);
+      await waitFor(() => ctx.notifies.some((n) => n.msg.includes(frag)), 5000, `${reason} notify`);
+      await waitFor(() => !existsSync(lockFile()), 5000, `${reason} lock removed`);
+    }
+  });
+
+  test("utterance answer never calls sendUserMessage, sendMessage or abort", async () => {
+    script(
+      { type: "utterance", id: "a1", text: "두 번째", kind: "answer", requestId: "r1", optionIndex: 1 },
+      { type: "utterance", id: "a2", text: "네", kind: "answer", requestId: "r1" },
+    );
+    const { pi, ctx } = setup();
+    ctx.idle = false;
+    await startVoice(pi, ctx);
+    await waitFor(() => (extLog().match(/utterance_received a[12] /g) ?? []).length === 2, 5000, "both answers received");
+    expect(pi.userMessages.length).toBe(0);
+    expect(pi.customMessages.length).toBe(0);
+    expect(ctx.abortCount).toBe(0);
+  });
+
+  test("refusal names the bound session title when it is the live child", async () => {
+    const a = setup();
+    a.ctx.sessionManager.getSessionName = () => "내 작업";
+    await startVoice(a.pi, a.ctx);
+    // hide the lock so the in-process child is the owner that is reported
+    const b = setup("/sessions/s-other.jsonl");
+    await b.pi.run("", b.ctx);
+    expect(b.ctx.notifies.at(-1)?.msg).toContain("내 작업");
+  });
+
+  test("session_shutdown resolves within 2000 ms when the bridge ignores stop", async () => {
+    process.env.FAKE_BRIDGE_IGNORE_STOP = "1";
+    const { pi, ctx } = setup();
+    await startVoice(pi, ctx);
+    const { pid } = readLock();
+    const t0 = performance.now();
+    await pi.fire("session_shutdown", { type: "session_shutdown", reason: "quit", signal: new AbortController().signal }, ctx);
+    expect(performance.now() - t0).toBeLessThan(2000);
+    expect(existsSync(lockFile())).toBe(false);
+    await waitFor(() => !pidAlive(pid), 3000, "bridge terminated");
+  });
+
+  test("session_shutdown with an already-aborted signal does not wait", async () => {
+    process.env.FAKE_BRIDGE_IGNORE_STOP = "1";
+    const { pi, ctx } = setup();
+    await startVoice(pi, ctx);
+    const { pid } = readLock();
+    const ac = new AbortController();
+    ac.abort();
+    const t0 = performance.now();
+    await pi.fire("session_shutdown", { type: "session_shutdown", reason: "quit", signal: ac.signal }, ctx);
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(existsSync(lockFile())).toBe(false);
+    await waitFor(() => !pidAlive(pid), 3000, "bridge terminated");
+  });
+});
+
 describe("event taps", () => {
   test("taps are inert while no bridge runs", async () => {
     const { pi, ctx } = setup();
