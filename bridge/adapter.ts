@@ -26,8 +26,12 @@ function cleanMarkdown(text: string): Cleaned {
   let prevBlank = true;
   let prevCode = false;
   const lines: string[] = [];
+  const rawLines = text.split(/\r?\n/);
+  let inDiff = false;
+  let oldLeft = 0;
+  let newLeft = 0;
 
-  for (const raw of text.split(/\r?\n/)) {
+  for (const [i, raw] of rawLines.entries()) {
     const t = raw.trim();
     if (t.startsWith("```") || t.startsWith("~~~")) {
       inFence = !inFence;
@@ -39,6 +43,29 @@ function cleanMarkdown(text: string): Cleaned {
     if (inFence) {
       removedCode = true;
       continue;
+    }
+    const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(t);
+    if (t.startsWith("diff --git ") || t.startsWith("@@ ") ||
+        (t.startsWith("--- a/") && rawLines[i + 1]?.trim().startsWith("+++ b/"))) {
+      inDiff = true;
+      oldLeft = hunk ? Number(hunk[1] ?? 1) : -1;
+      newLeft = hunk ? Number(hunk[2] ?? 1) : -1;
+      removedCode = true;
+      continue;
+    }
+    if (inDiff) {
+      if (/^(--- |\+\+\+ |index |(?:old|new|deleted file|new file) mode |\\ No newline at end of file)/.test(t)) {
+        removedCode = true;
+        continue;
+      }
+      // Hunk lengths distinguish following bullets from diff additions/deletions.
+      if ((oldLeft !== 0 || newLeft !== 0) && /^[ +\-]/.test(raw) && raw !== "") {
+        removedCode = true;
+        if (raw[0] !== "+") oldLeft--;
+        if (raw[0] !== "-") newLeft--;
+        continue;
+      }
+      inDiff = false;
     }
     if (t === "") {
       lines.push("");
