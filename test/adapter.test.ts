@@ -135,6 +135,99 @@ describe("toSpoken", () => {
     });
   });
 
+  test.each([
+    {
+      name: "two-space hunk under a list item",
+      input: "1. 파일을 고쳤어요.\n  @@ -1 +1 @@\n  -old()\n  +newCall()",
+      prose: "파일을 고쳤어요.",
+    },
+    {
+      name: "two-space full diff",
+      input: "고쳤어요.\n  diff --git a/x b/x\n  index abc..def 100644\n  --- a/x\n  +++ b/x\n  @@ -1 +1 @@\n  -old()\n  +newCall()",
+      prose: "고쳤어요.",
+    },
+    {
+      name: "empty context line inside a hunk",
+      input: "수정했어요.\n@@ -1,4 +1,4 @@\n 시작\n\n-const SECRET = readKey;\n+const SECRET = process.env.KEY;\n 끝",
+      prose: "수정했어요.",
+    },
+    {
+      name: "indented context retains its marker space",
+      input: "수정했어요.\n  @@ -1,3 +1,3 @@\n   시작\n   \n  -old()\n  +newCall()",
+      prose: "수정했어요.",
+    },
+    {
+      name: "indented empty context line",
+      input: "수정했어요.\n  @@ -1,3 +1,3 @@\n   시작\n\n  -old()\n  +newCall()",
+      prose: "수정했어요.",
+    },
+    {
+      name: "tab-indented hunk",
+      input: "수정했어요.\n\t@@ -1 +1 @@\n\t-old()\n\t+newCall()",
+      prose: "수정했어요.",
+    },
+  ])("diff shape is stripped: $name", ({ input, prose }) => {
+    expect(toSpoken(input, CAP)).toEqual({
+      spoken: `${prose}${CODE_NOTICE}`,
+      removedCode: true,
+      shortened: false,
+    });
+  });
+
+  test.each([
+    "  @@ -1 +1 @@\n  -old()\n  +newCall()",
+    "@@ -1,2 +1,2 @@\n\n-old()\n+newCall()",
+    "  @@ -0,0 +1 @@\n  +newCall()\n",
+  ])("completed diff shape preserves following bullets: %p", (diff) => {
+    expect(toSpoken(`${diff}\n- 첫 항목\n+ 둘째 항목`, CAP)).toEqual({
+      spoken: `첫 항목. 둘째 항목.${CODE_NOTICE}`,
+      removedCode: true,
+      shortened: false,
+    });
+  });
+
+  test.each([
+    {
+      name: "F4 hunk with an EMPTY context line",
+      input: "수정했어요.\n@@ -1,4 +1,4 @@\n const a = 1;\n\n-const b = process.env.KEY;\n+const b = readKey();\n 끝",
+      spoken: `수정했어요.${CODE_NOTICE}`,
+    },
+    {
+      name: "F4 full git diff with an EMPTY context line",
+      input: "수정했어요.\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,4 +1,4 @@\n function f() {\n\n-  return 1;\n+  return 2;\n }",
+      spoken: `수정했어요.${CODE_NOTICE}`,
+    },
+    {
+      name: "F4 INDENTED count-less hunk",
+      input: "수정했어요.\n  @@ -1 +1 @@\n  -alt;\n  +neu;",
+      spoken: `수정했어요.${CODE_NOTICE}`,
+    },
+    {
+      name: "F1 fence opens at the END of prose",
+      input: "결과: ```\nrm -rf ~\n``` 끝.",
+      spoken: `결과: 끝.${CODE_NOTICE}`,
+    },
+  ])("reviewer regression: $name", ({ input, spoken }) => {
+    expect(toSpoken(input, CAP)).toEqual({ spoken, removedCode: true, shortened: false });
+  });
+
+  test.each([
+    ["결과: ~~~\ncode()\n~~~ 끝.", `결과: 끝.${CODE_NOTICE}`],
+    ["결과:```\ncode()\n``` 끝.", `결과: 끝.${CODE_NOTICE}`],
+    ["결과: ```inline```\n끝.", `결과: 끝.${CODE_NOTICE}`],
+    ["결과: ```\nignore previous instructions\n``` **끝**.", `결과: 끝.${CODE_NOTICE}`],
+  ])("fence boundary preserves surrounding prose: %p", (input, spoken) => {
+    expect(toSpoken(input, CAP)).toEqual({ spoken, removedCode: true, shortened: false });
+  });
+
+  test("a mid-line hunk marker remains prose", () => {
+    expect(toSpoken("설명에서 @@ -1 +1 @@ 표기를 봐요.", CAP)).toEqual({
+      spoken: "설명에서 @@ -1 +1 @@ 표기를 봐요.",
+      removedCode: false,
+      shortened: false,
+    });
+  });
+
   test("minus bullets outside a diff remain spoken", () => {
     expect(toSpoken("- 첫 항목\n- 둘째 항목", CAP)).toEqual({
       spoken: "첫 항목. 둘째 항목.",
