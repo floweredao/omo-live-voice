@@ -1,0 +1,10 @@
+{
+  "name": "omo-live-voice-extension",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "/voice: talk to this omo session by voice through the omo-live-voice bridge",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
