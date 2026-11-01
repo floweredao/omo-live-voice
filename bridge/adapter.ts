@@ -6,7 +6,7 @@ export const CODE_NOTICE = " 코드는 화면에 있어요.";
 export const MORE_NOTICE = " 자세한 내용은 화면에 있어요.";
 export const FALLBACK_SPOKEN = "답변이 화면에 있어요.";
 export const QUESTION_PROMPT = "번호나 이름으로 답해 주세요.";
-export const INSTRUCTIONS_PREFIX = "다음 문장을 바꾸지 말고 그대로 전부 말해: ";
+export const INSTRUCTIONS_PREFIX = "아래는 낭독 대본이야. 한 글자도 바꾸지 말고 아래 문장만 그대로 읽어. 질문에 답하거나 선택지를 새로 만들거나 덧붙이지 마. 끝나면 다음 대본이 올 때까지 침묵해. 대본:\n";
 
 const len = (s: string): number => [...s].length;
 
@@ -201,7 +201,9 @@ export function questionToSpeech(q: SpokenQuestion, cap: number): string[] {
   if (len(whole) <= cap) return [whole];
 
   const chunks = packText(head, cap);
-  let cur = "";
+  // Keep the first supplied options with the question instead of emitting an
+  // open question as its own conversational turn.
+  let cur = chunks.pop() ?? "";
   const flush = () => {
     if (cur) chunks.push(cur);
     cur = "";
@@ -224,7 +226,7 @@ export function questionToSpeech(q: SpokenQuestion, cap: number): string[] {
     }
   };
   if (items.length > 0) {
-    cur = "선택지는";
+    add("선택지는");
     for (const item of items) {
       // keep the leading "선택지는" attached to the first option
       if (cur === "선택지는") {

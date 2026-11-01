@@ -14,6 +14,7 @@ export class TranscriptLog {
   private text = "";
   private startMs = 0;
   private endMs = 0;
+  private lines: { speaker: Speaker; text: string }[] = [];
 
   constructor(
     private readonly dir: string,
@@ -37,8 +38,16 @@ export class TranscriptLog {
     this.append(`- _${new Date().toISOString()} ${line}_\n`);
   }
 
+  /** The last n finished lines (flushes the line in progress first). */
+  recent(n: number): { speaker: Speaker; text: string }[] {
+    this.flush();
+    return this.lines.slice(-n);
+  }
+
   flush(): void {
     if (this.speaker && this.text.trim()) {
+      this.lines.push({ speaker: this.speaker, text: this.text.trim() });
+      if (this.lines.length > 50) this.lines.shift();
       this.append(`- [${(this.startMs / 1000).toFixed(1)}s] **${this.speaker}**: ${this.text.trim()}\n`);
     }
     this.speaker = null;

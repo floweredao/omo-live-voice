@@ -18,7 +18,8 @@ import { CAP_MS, COMMENTARY_CAP_CHARS, IDLE_MS, KEYCHAIN_SERVICE, LIVE_VOICE, SE
 import { readExt, sendExt } from "./ext-link.ts";
 import { Guard } from "./guard.ts";
 import { readApiKey } from "./keychain.ts";
-import { LiveSession, type LiveEvent } from "./live.ts";
+import { LiveSession, type HistoryLine, type LiveEvent } from "./live.ts";
+import { LogFile, redact } from "./logfile.ts";
 import { createToken, startServer, type PanelConn, type PanelServer } from "./server.ts";
 import { INITIAL_STATE, transition, type Axes, type Effect, type Event } from "./state.ts";
 import { Timers } from "./timers.ts";
@@ -35,7 +36,11 @@ const SPEECH_END_MS = 600;
 const DRAIN_FALLBACK_MS = 300;
 const QUESTION_CHUNK_TIMEOUT_MS = 15_000;
 const QUESTION_START_MS = 4_000;
-const SHUTDOWN_CLOSE_MS = 2_000;
+const GRACEFUL_CLOSE_MS = 15_000;
+const EOF_CLOSE_MS = 2_000;
+const ACTIVE_WINDOW_MS = 30_000;
+const HISTORY_LINES = 10;
+const COST_TICK_MS = 1_000;
 const CUT_PAD_MS = 500;
 const SEND_WORDS = /^(보내|보내줘|전송|send)$/i;
 const ANSWER_ON_SCREEN = "화면에서 답해 주세요";
@@ -48,8 +53,13 @@ const FAKE_CLOCK = process.env.OLV_FAKE_CLOCK === "1";
 let fakeNow = 0;
 const now = (): number => (FAKE_CLOCK ? fakeNow : Date.now());
 
-function log(level: "info" | "warn" | "error", msg: string): void {
+let logFile: LogFile | null = null;
+
+function log(level: "info" | "warn" | "error", raw: string): void {
+  const msg = redact(raw, apiKey ? [apiKey] : []);
   process.stderr.write(`${JSON.stringify({ level, msg })}\n`);
+  logFile ??= new LogFile(join(DATA_DIR, "logs"));
+  logFile.write({ level, event: msg.split(" ")[0], msg });
   if (level !== "info" && linkOpen && announced) sendExt({ type: "log", level, msg });
 }
 
@@ -71,6 +81,32 @@ let live: LiveSession | null = null;
 let liveClosing: Promise<void> | null = null;
 let ticker: ReturnType<typeof setInterval> | null = null;
 let shuttingDown = false;
+let closeTimeoutMs = GRACEFUL_CLOSE_MS;
+let lastSpeechAt = -Infinity;
+let reconnectBudget = 1;
+let reconnectHistory: HistoryLine[] = [];
+let lastCostAt = -Infinity;
+
+const LIVE_ERROR_KO: Record<string, string> = {
+  invalid_request_error: "요청이 올바르지 않아요. 다시 시도해 주세요.",
+  rate_limit: "요청이 너무 많아요. 잠시 후 다시 시도해 주세요.",
+  server_error: "음성 서버에 문제가 생겼어요. 잠시 후 다시 시도해 주세요.",
+  moderation: "안전 정책 때문에 음성이 중단됐어요.",
+};
+
+function liveErrorMessage(code: string, type: string): string {
+  for (const raw of [code, type]) {
+    if (LIVE_ERROR_KO[raw]) return LIVE_ERROR_KO[raw]!;
+    if (raw.startsWith("rate_limit")) return LIVE_ERROR_KO.rate_limit!;
+    if (/moderat|content_filter|content_policy/.test(raw)) return LIVE_ERROR_KO.moderation!;
+  }
+  return `음성 연결에 오류가 있어요. (${code})`;
+}
+
+function userStart(): void {
+  reconnectBudget = 1;
+  dispatch({ type: "start" });
+}
 
 let state: Axes = INITIAL_STATE;
 let adapter: AdapterState = initialAdapterState();
@@ -484,7 +520,7 @@ function sendNextChunk(): void {
 function appendQuestionChunk(eventId: string): void {
   const run = chunkRun;
   if (!run) return;
-  if (!live?.instructions(run.chunks[run.index]!, run.delegationId, eventId)) {
+  if (!live?.commentary(run.chunks[run.index]!, run.delegationId, eventId)) {
     log("warn", "question_chunk_not_sent");
     cancelQuestion();
   }
@@ -547,7 +583,7 @@ function onExt(msg: ExtToBridge | { type: "qa.clock"; now: number }): void {
       if (confirmMode === "off" && draft) apply({ type: "discardDraft" });
       return;
     case "resume":
-      if (state.connection === "closed") dispatch({ type: "start" });
+      if (state.connection === "closed") userStart();
       if (server) sendExt({ type: "ready", port: server.port, token, panelUrl: server.url });
       return;
     case "stop":
@@ -632,6 +668,7 @@ function onPanel(conn: PanelConn): void {
     pacer.push(new Uint8Array(frame.pcm.buffer, frame.pcm.byteOffset, frame.pcm.byteLength));
     const cue = vad.classify(frame.pcm, state.output === "speaking");
     if (isVoiced(frame.pcm, MIC_RMS)) {
+      lastSpeechAt = now();
       timers.start("speechEnd", SPEECH_END_MS, () => {
         dispatch({ type: "speech.end" });
         completeInputTurn();
@@ -656,7 +693,7 @@ function onPanel(conn: PanelConn): void {
     panel = null;
     dispatch({ type: "panel.disconnected" });
   });
-  if (state.connection === "closed" && !shuttingDown) dispatch({ type: "start" });
+  if (state.connection === "closed" && !shuttingDown) userStart();
 }
 
 function onControl(action: "mute" | "unmute" | "stop" | "resume" | "confirm" | "discard"): void {
@@ -671,10 +708,9 @@ function onControl(action: "mute" | "unmute" | "stop" | "resume" | "confirm" | "
       dispatch({ type: "unmute" });
       return syncLiveMute();
     case "stop":
-      flushReason = "stop";
-      return dispatch({ type: "stop" });
+      return void shutdown(0, "stop");
     case "resume":
-      return dispatch({ type: "start" });
+      return userStart();
     case "confirm":
       if (draft) {
         const held = draft;
@@ -697,7 +733,8 @@ function syncLiveMute(): void {
 
 function openLive(): void {
   if (live) return log("warn", "open_while_live");
-  const session = new LiveSession({ apiKey, log: (line) => log("info", line) });
+  const session = new LiveSession({ apiKey, log: (line) => log("info", line), history: reconnectHistory });
+  reconnectHistory = [];
   live = session;
   closeReason = undefined;
   fragments = [];
@@ -751,7 +788,9 @@ function openLive(): void {
   session.onEvent("session.usage.updated", mine(() => sendCost()));
   session.onEvent("error", mine((e) => {
     const code = String(e.error?.code ?? "unknown");
-    if (session.ready) panel?.send({ type: "error", code: "live_error", message: code, recoverable: true });
+    const type = String(e.error?.type ?? "");
+    log("warn", `live_error code=${code.slice(0, 60)} type=${type.slice(0, 60)}`);
+    if (session.ready) panel?.send({ type: "error", code, message: liveErrorMessage(code, type), recoverable: true });
   }));
   session.onEvent("session.closed", mine((e) => {
     guard.disconnected();
@@ -759,14 +798,29 @@ function openLive(): void {
     connectedAt = null;
     live = null;
     closeReason = String(e.reason ?? "closed");
-    if (closeReason === "live_dropped") {
-      panel?.send({ type: "error", code: "live_dropped", message: "Live connection dropped", recoverable: true });
+    log("info", `final_usage seconds=${String(e.usage?.seconds ?? session.usageSeconds)} reason=${closeReason}`);
+    const dropped = closeReason === "live_dropped";
+    const active = now() - lastSpeechAt <= ACTIVE_WINDOW_MS;
+    const reconnect = dropped && active && reconnectBudget > 0 && !shuttingDown && panel !== null;
+    if (dropped) {
+      log("warn", `live_dropped active=${active} reconnect=${reconnect}`);
+      if (!reconnect) {
+        const unavailable = active && !shuttingDown;
+        panel?.send(unavailable
+          ? { type: "error", code: "live_unavailable", message: "음성 연결이 끊겨 다시 연결하지 못했어요. 다시 시작해 주세요.", recoverable: true }
+          : { type: "error", code: "live_dropped", message: "Live connection dropped", recoverable: true });
+      }
     }
     cancelQuestion();
     timers.cancel("inputComplete");
     timers.cancel("speechEnd");
     inputTurn = [];
     dispatch({ type: "live.closed", reason: closeReason });
+    if (reconnect) {
+      reconnectBudget--;
+      reconnectHistory = (transcript?.recent(HISTORY_LINES) ?? []).map((l) => ({ role: l.speaker === "사용자" ? "user" : "assistant", text: l.text }));
+      dispatch({ type: "start" });
+    }
   }));
   session.start().catch((err: Error) => {
     if (live !== session) return;
@@ -798,10 +852,13 @@ function closeLive(): void {
     connectedAt = null;
   }
   if (!session) return;
-  liveClosing = session.close(SHUTDOWN_CLOSE_MS).catch((e: Error) => log("warn", `live_close_failed ${e.message.slice(0, 80)}`));
+  liveClosing = session.close(closeTimeoutMs)
+    .then(() => log("info", `final_usage seconds=${session.usageSeconds}`))
+    .catch((e: Error) => log("warn", `live_close_failed ${e.message.slice(0, 80)}`));
 }
 
 function sendCost(): void {
+  lastCostAt = now();
   const cumulativeMs = guard.cumulativeMs();
   panel?.send({ type: "cost", connectedMs: connectedAt === null ? 0 : now() - connectedAt, cumulativeMs, estimatedUsd: guard.estimatedUsd() });
 }
@@ -809,6 +866,7 @@ function sendCost(): void {
 
 function tick(): void {
   timers.poll();
+  if (connectedAt !== null && now() - lastCostAt >= COST_TICK_MS) sendCost();
   if (live && state.connection === "open" && captureEnabled && !state.muted) live.appendAudio(pacer.take(TICK_MS));
 }
 
@@ -821,6 +879,7 @@ async function boot(): Promise<void> {
   }
   if (shuttingDown) return;
   token = createToken();
+  logFile?.addSecret(apiKey);
   transcript = new TranscriptLog(join(DATA_DIR, "transcripts"));
   let panelDir = PANEL_DIR;
   if (!existsSync(panelDir)) {
@@ -839,13 +898,14 @@ async function boot(): Promise<void> {
   announced = true;
 }
 
-async function shutdown(code: number, reason: string): Promise<void> {
+async function shutdown(code: number, reason: string, closeMs = GRACEFUL_CLOSE_MS): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
+  closeTimeoutMs = closeMs;
   flushReason = "stop";
   dispatch({ type: "stop" });
   if (live) closeLive();
-  if (liveClosing) await Promise.race([liveClosing, Bun.sleep(SHUTDOWN_CLOSE_MS)]);
+  if (liveClosing) await Promise.race([liveClosing, Bun.sleep(closeMs + 500)]);
   if (ticker) clearInterval(ticker);
   timers.clear();
   transcript?.flush();
@@ -874,5 +934,5 @@ if (process.argv.includes("--standalone")) {
 
 void readExt(onExt as (msg: ExtToBridge) => void).then(() => {
   log("info", "stdin_closed");
-  void shutdown(0, "stdin_closed");
+  void shutdown(0, "stdin_closed", EOF_CLOSE_MS);
 });

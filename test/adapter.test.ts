@@ -183,6 +183,7 @@ describe("questionToSpeech", () => {
     expect(chunks.length).toBeGreaterThanOrEqual(3);
     for (const c of chunks) expect(cp(c)).toBeLessThanOrEqual(CAP);
     const joined = chunks.join(" ");
+    expect(chunks[0]).toContain(labels[0]!);
     let last = -1;
     for (const l of labels) {
       expect(joined.split(l).length - 1).toBe(1);

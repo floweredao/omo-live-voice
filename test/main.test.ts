@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Subprocess } from "bun";
-import { decodeFrame } from "../shared/protocol.ts";
+import { decodeFrame, encodeFrame } from "../shared/protocol.ts";
 import type { BridgeToPanel } from "../shared/protocol.ts";
 import { INSTRUCTIONS_PREFIX, questionToSpeech } from "../bridge/adapter.ts";
 import { COMMENTARY_CAP_CHARS } from "../bridge/config.ts";
@@ -36,9 +36,9 @@ function fakeLive(autoStart = true): FakeLive {
           drop = () => ws.close();
           ping = () => ws.ping();
           if (autoStart) ws.send(JSON.stringify({ type: "session.started", client_event_id: msg.event_id, session: { id: "fake-main", ...msg.session } }));
-        } else if (msg.type === "session.instructions.append") {
+        } else if (msg.type === "session.commentary.append") {
           // A real appended ack confirms receipt, not that speech has started or ended.
-          ws.send(JSON.stringify({ type: "session.instructions.appended", client_event_id: msg.event_id, start_ms: 0, end_ms: 200 }));
+          ws.send(JSON.stringify({ type: "session.commentary.appended", client_event_id: msg.event_id, start_ms: 0, end_ms: 200 }));
         } else if (msg.type === "session.input_audio.mute" || msg.type === "session.input_audio.unmute") {
           ws.send(JSON.stringify({ type: msg.type === "session.input_audio.mute" ? "session.input_audio.muted" : "session.input_audio.unmuted", client_event_id: msg.event_id }));
         } else if (msg.type === "session.close") {
@@ -80,7 +80,7 @@ function bounded<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   return Promise.race([p, deadline]).finally(() => clearTimeout(timer));
 }
 
-type Bridge = { proc: Subprocess<"pipe", "pipe", "pipe">; stdout: string[]; nextJson(type: string, ms: number, pred?: (j: any) => boolean): Promise<any>; send(msg: unknown): void };
+type Bridge = { dataDir: string; proc: Subprocess<"pipe", "pipe", "pipe">; stdout: string[]; nextJson(type: string, ms: number, pred?: (j: any) => boolean): Promise<any>; send(msg: unknown): void };
 
 const cleanups: (() => void | Promise<void>)[] = [];
 afterEach(async () => {
@@ -118,6 +118,7 @@ function spawnBridge(env: Record<string, string>): Bridge {
     }
   })();
   return {
+    dataDir,
     proc,
     stdout,
     nextJson(type, ms, pred = () => true) {
@@ -215,7 +216,18 @@ async function regressionBridge(autoStart = true, idleMs = "200000") {
   send({ type: "hello", token: ready.token, capabilities: { audioWorklet: true, setSinkId: false }, sampleRate: 24000 });
   await live.waitFor("session.start", 2000);
   if (opened) await opened;
-  return { live, bridge, messages, nextPanel, send, barrier, clock, delta, output, syncLive };
+  // A voiced mic frame, then mute/unmute: panel messages are ordered, so the state echo proves the frame was processed.
+  const speak = async () => {
+    const pcm = new Int16Array(2400).fill(3000);
+    ws.send(encodeFrame(1, 0, pcm));
+    const muted = nextPanel((m) => m.type === "state" && m.muted);
+    send({ type: "control", action: "mute" });
+    await muted;
+    const unmuted = nextPanel((m) => m.type === "state" && !m.muted);
+    send({ type: "control", action: "unmute" });
+    await unmuted;
+  };
+  return { live, bridge, messages, nextPanel, send, barrier, clock, delta, output, syncLive, speak };
 }
 
 const CHUNK_QUESTION = {
@@ -227,7 +239,7 @@ describe("P3 question chunks", () => {
   test("transcript deltas hold the next chunk until both streams are quiet", async () => {
     // Given: the current chunk has voiced PCM, followed by continuing transcript deltas.
     const h = await regressionBridge();
-    const first = h.live.waitFor("session.instructions.append", 2000);
+    const first = h.live.waitFor("session.commentary.append", 2000);
     h.bridge.send(CHUNK_QUESTION);
     await first;
     await h.output("first", true);
@@ -238,31 +250,31 @@ describe("P3 question chunks", () => {
     }
     await h.syncLive();
     // Then: neither PCM silence nor an appended ack can advance this chunk.
-    expect(h.live.received.filter((m) => m.type === "session.instructions.append")).toHaveLength(1);
+    expect(h.live.received.filter((m) => m.type === "session.commentary.append")).toHaveLength(1);
     await h.clock(1599);
     await h.syncLive();
-    expect(h.live.received.filter((m) => m.type === "session.instructions.append")).toHaveLength(1);
-    const next = h.live.waitFor("session.instructions.append", 2000, h.live.received.length);
+    expect(h.live.received.filter((m) => m.type === "session.commentary.append")).toHaveLength(1);
+    const next = h.live.waitFor("session.commentary.append", 2000, h.live.received.length);
     await h.clock(1600);
     await next;
-    expect(h.live.received.filter((m) => m.type === "session.instructions.append")).toHaveLength(2);
+    expect(h.live.received.filter((m) => m.type === "session.commentary.append")).toHaveLength(2);
   });
 
   test("acknowledged no-speech chunk is retried once with a new id then times out", async () => {
     // Given: Live acknowledges every append but emits only silent PCM.
     const h = await regressionBridge();
-    const first = h.live.waitFor("session.instructions.append", 2000);
+    const first = h.live.waitFor("session.commentary.append", 2000);
     h.bridge.send(CHUNK_QUESTION);
     await first;
     h.live.emit({ type: "session.output_audio.delta", delta: Buffer.alloc(4800).toString("base64") });
     // When: the short start window expires.
     await h.clock(3999);
     await h.syncLive();
-    expect(h.live.received.filter((m) => m.type === "session.instructions.append")).toHaveLength(1);
-    const retry = h.live.waitFor("session.instructions.append", 2000, h.live.received.length);
+    expect(h.live.received.filter((m) => m.type === "session.commentary.append")).toHaveLength(1);
+    const retry = h.live.waitFor("session.commentary.append", 2000, h.live.received.length);
     await h.clock(4000);
     await retry;
-    const appends = () => h.live.received.filter((m) => m.type === "session.instructions.append");
+    const appends = () => h.live.received.filter((m) => m.type === "session.commentary.append");
     expect(appends()).toHaveLength(2);
     expect(appends()[1]?.content).toBe(appends()[0]?.content);
     expect(appends()[1]?.event_id).not.toBe(appends()[0]?.event_id);
@@ -282,15 +294,16 @@ describe("P3 question chunks", () => {
   });
 
   test("all 8x80 option chunks are appended in order without speech overlap", async () => {
-    // Given: the actual runtime cap produces three chunks for eight 80-character labels.
+    // Given: packing supplied options with the header yields two runtime chunks.
     const h = await regressionBridge();
     expect(CHUNK_QUESTION.options.map((o) => [...o.label].length)).toEqual(Array(8).fill(80));
     const chunks = questionToSpeech(CHUNK_QUESTION, COMMENTARY_CAP_CHARS - [...INSTRUCTIONS_PREFIX].length);
-    expect(chunks).toHaveLength(3);
-    const first = h.live.waitFor("session.instructions.append", 2000);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toContain(CHUNK_QUESTION.options[0]!.label);
+    const first = h.live.waitFor("session.commentary.append", 2000);
     h.bridge.send(CHUNK_QUESTION);
     await first;
-    const appends = () => h.live.received.filter((m) => m.type === "session.instructions.append");
+    const appends = () => h.live.received.filter((m) => m.type === "session.commentary.append");
     // When: each chunk has a PCM gap with continuing transcript, then the reverse.
     for (const [i, chunk] of chunks.entries()) {
       const t = i * 2000;
@@ -313,7 +326,7 @@ describe("P3 question chunks", () => {
       await h.clock(t + 1799);
       await h.syncLive();
       expect(appends()).toHaveLength(i + 1);
-      const next = i + 1 < chunks.length ? h.live.waitFor("session.instructions.append", 2000, h.live.received.length) : null;
+      const next = i + 1 < chunks.length ? h.live.waitFor("session.commentary.append", 2000, h.live.received.length) : null;
       await h.clock(t + 1800);
       if (next) await next;
     }
@@ -327,10 +340,10 @@ describe("P3 question chunks", () => {
   test("retry speech completes before the next chunk and transcript-only startup cancels retry", async () => {
     // Given: the first attempt is acknowledged without speech.
     const h = await regressionBridge();
-    const first = h.live.waitFor("session.instructions.append", 2000);
+    const first = h.live.waitFor("session.commentary.append", 2000);
     h.bridge.send(CHUNK_QUESTION);
     await first;
-    const retry = h.live.waitFor("session.instructions.append", 2000, h.live.received.length);
+    const retry = h.live.waitFor("session.commentary.append", 2000, h.live.received.length);
     await h.clock(4000);
     await retry;
     // When: the retry starts with transcript only; PCM later extends its completion.
@@ -339,8 +352,8 @@ describe("P3 question chunks", () => {
     await h.output("retry-end", true);
     await h.clock(4999);
     await h.syncLive();
-    expect(h.live.received.filter((m) => m.type === "session.instructions.append")).toHaveLength(2);
-    const next = h.live.waitFor("session.instructions.append", 2000, h.live.received.length);
+    expect(h.live.received.filter((m) => m.type === "session.commentary.append")).toHaveLength(2);
+    const next = h.live.waitFor("session.commentary.append", 2000, h.live.received.length);
     await h.clock(5000);
     await next;
     // Then: transcript-only progress also prevents another startup retry.
@@ -349,7 +362,7 @@ describe("P3 question chunks", () => {
       await h.output(`transcript-only-${t}`);
     }
     await h.syncLive();
-    expect(h.live.received.filter((m) => m.type === "session.instructions.append")).toHaveLength(3);
+    expect(h.live.received.filter((m) => m.type === "session.commentary.append")).toHaveLength(3);
     expect(h.messages.some((m) => m.type === "error" && m.code === "question_speech_timeout")).toBe(false);
   });
 
@@ -359,11 +372,11 @@ describe("P3 question chunks", () => {
     for (const [i, mode] of ["close", "drop", "close", "drop"].entries()) {
       const t = i * 20000;
       await h.clock(t);
-      const first = h.live.waitFor("session.instructions.append", 2000, h.live.received.length);
+      const first = h.live.waitFor("session.commentary.append", 2000, h.live.received.length);
       h.bridge.send({ ...CHUNK_QUESTION, requestId: `cancel-${i}` });
       await first;
       if (mode === "drop") await h.output(`interrupted-${i}`, true);
-      const count = h.live.received.filter((m) => m.type === "session.instructions.append").length;
+      const count = h.live.received.filter((m) => m.type === "session.commentary.append").length;
       // When: question closure or transport loss invalidates its timers.
       if (mode === "close") {
         h.bridge.send({ type: "agent.question.closed", requestId: `cancel-${i}` });
@@ -381,7 +394,7 @@ describe("P3 question chunks", () => {
       await h.clock(t + 16000);
       await h.syncLive();
       // Then: stale callbacks neither retry nor append a next chunk on the new session.
-      expect(h.live.received.filter((m) => m.type === "session.instructions.append")).toHaveLength(count);
+      expect(h.live.received.filter((m) => m.type === "session.commentary.append")).toHaveLength(count);
       expect(h.messages.some((m) => m.type === "error" && m.code === "question_speech_timeout")).toBe(false);
     }
   });
@@ -401,9 +414,8 @@ describe("P3 regressions", () => {
     // Then: both this socket and a resumed socket receive the desired state.
     expect(h.live.received.filter((m) => m.type === "session.input_audio.mute")).toHaveLength(1);
     const closed = h.nextPanel((m) => m.type === "state" && m.connection === "closed");
-    h.send({ type: "control", action: "stop" });
+    h.live.drop();
     await closed;
-    await h.live.waitFor("session.close", 2000);
     const from = h.live.received.length;
     const restarted = h.live.waitFor("session.start", 2000, from);
     h.bridge.send({ type: "resume" });
@@ -500,9 +512,8 @@ describe("P3 regressions", () => {
       await h.barrier();
       if (round === 0) {
         const closed = h.nextPanel((m) => m.type === "state" && m.connection === "closed");
-        h.send({ type: "control", action: "stop" });
+        h.live.drop();
         await closed;
-        await h.live.waitFor("session.close", 2000);
         const reopened = h.nextPanel((m) => m.type === "state" && m.connection === "open");
         h.bridge.send({ type: "resume" });
         await reopened;
@@ -558,7 +569,7 @@ describe("P3 regressions", () => {
   test("(l) progressing question speech survives the original 15 second deadline", async () => {
     // Given: a long question whose first chunk is still being voiced at 15 seconds.
     const h = await regressionBridge();
-    const append = h.live.waitFor("session.instructions.append", 2000);
+    const append = h.live.waitFor("session.commentary.append", 2000);
     h.bridge.send({ type: "agent.question", requestId: "long", header: "h", question: "긴 질문 ".repeat(200), options: [{ label: "예" }] });
     await append;
     const pcm = Buffer.alloc(4800);
@@ -578,10 +589,10 @@ describe("P3 regressions", () => {
     await h.clock(15001);
     // Then: no timeout; the next chunk waits for this one's actual speech end.
     expect(h.bridge.stdout.some((l) => l.includes("question_chunk_timeout"))).toBe(false);
-    expect(h.live.received.filter((m) => m.type === "session.instructions.append")).toHaveLength(1);
+    expect(h.live.received.filter((m) => m.type === "session.commentary.append")).toHaveLength(1);
     await progress(15001);
     const from = h.live.received.length;
-    const nextChunk = h.live.waitFor("session.instructions.append", 2000, from);
+    const nextChunk = h.live.waitFor("session.commentary.append", 2000, from);
     await h.clock(15601);
     await nextChunk;
     expect(h.messages.some((m) => m.type === "error" && m.code === "question_speech_timeout")).toBe(false);
@@ -592,6 +603,126 @@ describe("P3 regressions", () => {
     expect(await timeout).toMatchObject({ recoverable: true });
     h.bridge.send({ type: "stop" });
     expect(await bounded(h.bridge.proc.exited, 3000, "regression exit")).toBe(0);
+  });
+});
+
+describe("P4 bridge polish", () => {
+  const starts = (h: { live: FakeLive }) => h.live.received.filter((m) => m.type === "session.start");
+
+  test("drop while the user is active reconnects exactly once with history, then reports live_unavailable", async () => {
+    // Given: the user has spoken and both sides have transcript lines.
+    const h = await regressionBridge();
+    await h.speak();
+    await h.delta("안녕하세요", 0, 500);
+    await h.output("반가워요");
+    const from = h.live.received.length;
+    const closed = h.nextPanel((m) => m.type === "state" && m.connection === "closed" && m.reason === "live_dropped");
+    const connecting = h.nextPanel((m) => m.type === "state" && m.connection === "connecting");
+    const reopened = h.nextPanel((m) => m.type === "state" && m.connection === "open");
+    const restarted = h.live.waitFor("session.start", 2000, from);
+    // When: the socket drops without session.closed.
+    h.live.drop();
+    // Then: closed(live_dropped), connecting, then a fresh session seeded with the history.
+    await closed;
+    await connecting;
+    await restarted;
+    await reopened;
+    expect(starts(h)).toHaveLength(2);
+    const seeded = h.live.received.slice(from).find((m) => m.type === "session.start")!;
+    expect(seeded.session.input).toEqual([
+      { type: "message", role: "user", content: [{ type: "input_text", text: "안녕하세요" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "반가워요" }] },
+    ]);
+    expect(seeded.session.audio.output.voice).toBe("cedar");
+    expect(starts(h)[0]!.session.input).toEqual([]);
+    // When: the reconnected socket also drops.
+    const unavailable = h.nextPanel((m) => m.type === "error" && m.code === "live_unavailable");
+    const closedAgain = h.nextPanel((m) => m.type === "state" && m.connection === "closed");
+    h.live.drop();
+    // Then: no further reconnect.
+    expect(await unavailable).toMatchObject({ recoverable: true });
+    await closedAgain;
+    await h.barrier();
+    expect(starts(h)).toHaveLength(2);
+    expect(h.bridge.stdout.join("\n")).toContain("live_dropped active=true reconnect=true");
+    h.bridge.send({ type: "stop" });
+    expect(await bounded(h.bridge.proc.exited, 3000, "exit")).toBe(0);
+  });
+
+  test("a drop after more than 30 s without speech does not reconnect", async () => {
+    const h = await regressionBridge();
+    await h.speak();
+    await h.clock(30_001);
+    const closed = h.nextPanel((m) => m.type === "state" && m.connection === "closed" && m.reason === "live_dropped");
+    h.live.drop();
+    await closed;
+    await h.barrier();
+    expect(starts(h)).toHaveLength(1);
+    expect(h.messages.some((m) => m.type === "error" && m.code === "live_dropped")).toBe(true);
+    h.bridge.send({ type: "stop" });
+    expect(await bounded(h.bridge.proc.exited, 3000, "exit")).toBe(0);
+  });
+
+  test("a guard idle close never reconnects", async () => {
+    const h = await regressionBridge(true, "2000");
+    await h.speak();
+    await h.clock(700);
+    const closed = h.nextPanel((m) => m.type === "state" && m.connection === "closed");
+    await h.clock(5000);
+    expect(await closed).toMatchObject({ reason: "idle" });
+    await h.barrier();
+    expect(starts(h)).toHaveLength(1);
+    expect(h.messages.filter((m) => m.type === "state" && m.connection === "connecting")).toHaveLength(1);
+    h.bridge.send({ type: "stop" });
+    expect(await bounded(h.bridge.proc.exited, 3000, "exit")).toBe(0);
+  });
+
+  test("GPT-Live error events become panel error envelopes with a Korean message", async () => {
+    const h = await regressionBridge();
+    for (const [code, type] of [
+      ["invalid_request_error", "invalid_request_error"],
+      ["rate_limit_exceeded", "rate_limit_error"],
+      ["server_error", "server_error"],
+      ["moderation_blocked", "invalid_request_error"],
+    ] as const) {
+      const seen = h.nextPanel((m) => m.type === "error" && m.code === code);
+      h.live.emit({ type: "error", error: { type, code, message: "details" } });
+      const msg = (await seen) as Extract<BridgeToPanel, { type: "error" }>;
+      expect(msg.message).toMatch(/[가-힣]/);
+      expect(msg.message).not.toContain(code);
+      expect(msg.recoverable).toBe(true);
+    }
+    h.bridge.send({ type: "stop" });
+    expect(await bounded(h.bridge.proc.exited, 3000, "exit")).toBe(0);
+  });
+
+  test("the log file is JSONL, redacted, and holds the final usage", async () => {
+    const h = await regressionBridge();
+    h.bridge.send({ type: "sk-probe-secret-123" });
+    await h.barrier();
+    h.bridge.send({ type: "stop" });
+    expect(await bounded(h.bridge.proc.exited, 3000, "exit")).toBe(0);
+    const dir = join(h.bridge.dataDir, "logs");
+    const files = readdirSync(dir).filter((n) => n.endsWith(".log"));
+    expect(files).toHaveLength(1);
+    const text = readFileSync(join(dir, files[0]!), "utf8");
+    const records = text.trim().split("\n").map((l) => JSON.parse(l));
+    expect(records.every((r) => typeof r.ts === "string" && typeof r.level === "string")).toBe(true);
+    expect(text).not.toContain("sk-");
+    expect(text).toContain("[redacted]");
+    expect(records.some((r) => String(r.msg).startsWith("final_usage seconds=1"))).toBe(true);
+    expect(h.bridge.stdout.join("\n")).not.toContain("sk-");
+  });
+
+  test("the panel stop control ends the session like /voice stop", async () => {
+    const h = await regressionBridge();
+    const closed = h.nextPanel((m) => m.type === "state" && m.connection === "closed");
+    h.send({ type: "control", action: "stop" });
+    expect(await closed).toMatchObject({ reason: "stop" });
+    expect(await bounded(h.bridge.proc.exited, 3000, "exit after panel stop")).toBe(0);
+    expect(h.live.received.some((m) => m.type === "session.close")).toBe(true);
+    const exits = h.bridge.stdout.map((l) => JSON.parse(l)).filter((m) => m.type === "exit");
+    expect(exits).toEqual([{ type: "exit", reason: "stop" }]);
   });
 });
 

@@ -8,13 +8,25 @@ export type LiveOptions = {
   /** Overrides LIVE_URL (tests only; the voice is never configurable). */
   url?: string;
   log?: (line: string) => void;
+  /** Prior conversation seeded into `input` (reconnect only). */
+  history?: readonly HistoryLine[];
 };
 
-export function sessionConfig() {
+export type HistoryLine = { role: "user" | "assistant"; text: string };
+
+export function historyInput(history: readonly HistoryLine[]): unknown[] {
+  return history.map((h) => ({
+    type: "message",
+    role: h.role,
+    content: [{ type: h.role === "user" ? "input_text" : "output_text", text: h.text.slice(0, 500) }],
+  }));
+}
+
+export function sessionConfig(history: readonly HistoryLine[] = []) {
   return {
     model: LIVE_MODEL,
     instructions: INSTRUCTIONS_KO,
-    input: [] as unknown[],
+    input: historyInput(history),
     audio: { format: { type: "audio/pcm", rate: LIVE_RATE }, output: { voice: LIVE_VOICE } },
     delegation: { type: "client", acknowledgement_delay_ms: ACK_DELAY_MS },
   };
@@ -95,7 +107,7 @@ export class LiveSession {
         ws.close();
       }, timeoutMs);
       ws.addEventListener("open", () => {
-        ws.send(JSON.stringify({ type: "session.start", event_id: "event_start", session: sessionConfig() }));
+        ws.send(JSON.stringify({ type: "session.start", event_id: "event_start", session: sessionConfig(this.opts.history) }));
       });
       ws.addEventListener("message", (m) => {
         let event: LiveEvent;

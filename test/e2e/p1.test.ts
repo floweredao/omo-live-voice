@@ -412,10 +412,10 @@ async function runQuestion(liveEnv: Record<string, string>, waitDone: "all" | "t
     [timeoutLog, timeoutPanelError] = await Promise.all([timeoutLogPromise!, timeoutPanelErrorPromise!]);
   } else {
     for (let n = 1; ; n++) {
-      const append = await live.tap.wait((e) => e.dir === "in" && e.type === "session.instructions.append" && e.ev.event_id?.endsWith(`-${n}`), 20_000, `instructions.append #${n}`);
+      const append = await live.tap.wait((e) => e.dir === "in" && e.type === "session.commentary.append" && e.ev.event_id?.endsWith(`-${n}`), 20_000, `commentary.append #${n}`);
       const ai = live.tap.items.indexOf(append);
       await live.tap.wait((e) => e.type === "session.output_audio.delta" && e.voiced === true, 15_000, `chunk ${n} voiced`, ai);
-      const next = live.tap.wait((e) => e.dir === "in" && e.type === "session.instructions.append" && e.ev.event_id?.endsWith(`-${n + 1}`), 8_000, "next chunk", ai).catch(() => null);
+      const next = live.tap.wait((e) => e.dir === "in" && e.type === "session.commentary.append" && e.ev.event_id?.endsWith(`-${n + 1}`), 8_000, "next chunk", ai).catch(() => null);
       if (!(await next)) break;
     }
   }
@@ -431,9 +431,12 @@ const runQ = memo(() => runQuestion({}, "all"));
 const runQAckAfter = memo(() => runQuestion({ OLV_FAKE_ACK_AFTER_AUDIO: "1" }, "all"));
 
 function assertChunks(r: Awaited<ReturnType<typeof runQuestion>>) {
-  const appends = r.log.filter((e) => e.type === "session.instructions.append");
-  expect(appends.length).toBeGreaterThanOrEqual(3);
+  const appends = r.log.filter((e) => e.type === "session.commentary.append");
+  expect(appends).toHaveLength(2);
   const contents = appends.map((e) => String(e.event.content));
+  expect(contents[0]).toContain(LABELS[0]!);
+  expect(appends.every((e) => e.event.delegation_id === "d1")).toBe(true);
+  expect(r.log.filter((e) => e.type === "session.instructions.append")).toHaveLength(0);
   for (const c of contents) expect(cps(c)).toBeLessThanOrEqual(COMMENTARY_CAP_CHARS);
   const inOrder = (hay: string) => {
     let at = 0;
@@ -450,7 +453,7 @@ function assertChunks(r: Awaited<ReturnType<typeof runQuestion>>) {
   const panelTr = envs(r.summary, "transcript").filter((e) => e.speaker === "assistant").map((e) => String(e.text));
   expect(inOrder(panelTr.join(" "))).toBe(true);
   // ordering: append n+1 only after chunk n's last voiced delta + 600 ms (tap clock)
-  const tapAppends = r.tap.filter((e) => e.dir === "in" && e.type === "session.instructions.append");
+  const tapAppends = r.tap.filter((e) => e.dir === "in" && e.type === "session.commentary.append");
   expect(tapAppends.length).toBe(appends.length);
   const gaps: number[] = [];
   for (let n = 0; n + 1 < tapAppends.length; n++) {
@@ -470,6 +473,24 @@ function assertChunks(r: Awaited<ReturnType<typeof runQuestion>>) {
 }
 
 describe("P1 e2e: bridge vs fake GPT-Live / extension / panel", () => {
+  test("question without a delegation uses session-wide commentary and produces audio", async () => {
+    // Given: an open voice session with no user turn or client delegation.
+    const b = await boot({}, {}, ["--tail-ms", "15000", "--linger-ms", "500"]);
+    await b.live.tap.wait((e) => e.type === "session.started", 5000, "session started");
+    const append = b.live.tap.wait((e) => e.dir === "in" && e.type === "session.commentary.append", 5000, "session-wide question");
+    const audio = b.live.tap.wait((e) => e.type === "session.output_audio.delta" && e.voiced === true, 5000, "question audio");
+    // When: the agent asks a short question independently of microphone input.
+    b.ext.emit({ ...QUESTION, options: [{ label: "선택" }] });
+    // Then: a null delegation is sent explicitly, and the panel receives the audio.
+    expect((await append).ev.delegation_id).toBeNull();
+    await audio;
+    await b.ext.out.wait(recv("state", (m) => m.output === "idle"), 10000, "question finished", b.ext.out.items.length);
+    const summary = await b.panel.finish();
+    expect(summary.receivedPcmBytes).toBeGreaterThan(48_000);
+    expect(b.live.tap.items.some((e) => e.type === "session.delegation.created")).toBe(false);
+    await teardown(b);
+  }, 20000);
+
   test("(QA) live_dropped closes both links within 2 s and resumes after two SIGKILL drops", async () => {
     const b = await boot({}, { OLV_FAKE_CLOCK: "1", OLV_IDLE_MS: "200" }, null);
     const ws = new WebSocket(`ws://127.0.0.1:${b.ext.ready.port}/ws?token=${b.ext.ready.token}`, {
@@ -566,7 +587,7 @@ describe("P1 e2e: bridge vs fake GPT-Live / extension / panel", () => {
     expect(log.filter((e) => e.type === "session.commentary.append")).toHaveLength(1);
   }, 60_000);
 
-  test("(2c) long question: >= 3 sequenced instructions chunks, each after the previous chunk's speech + 600 ms", async () => {
+  test("(2c) long question: sequenced commentary chunks, each after the previous chunk's speech + 600 ms", async () => {
     const r = await runQ();
     const { chunks, gaps } = assertChunks(r);
     console.log(`2c chunks=${chunks} gaps_ms=${gaps.join(",")}`);
@@ -578,17 +599,17 @@ describe("P1 e2e: bridge vs fake GPT-Live / extension / panel", () => {
     const base = await runQ();
     const { chunks, gaps } = assertChunks(r);
     console.log(`2d chunks=${chunks} gaps_ms=${gaps.join(",")}`);
-    expect(r.log.filter((e) => e.type === "session.instructions.append").map((e) => e.event.content)).toEqual(
-      base.log.filter((e) => e.type === "session.instructions.append").map((e) => e.event.content),
+    expect(r.log.filter((e) => e.type === "session.commentary.append").map((e) => e.event.content)).toEqual(
+      base.log.filter((e) => e.type === "session.commentary.append").map((e) => e.event.content),
     );
     expect(r.errs.some((l) => l.msg.includes("question_chunk_timeout"))).toBe(false);
   }, 120_000);
 
   test("(2e) OLV_FAKE_MUTE_OUTPUT=1: one retry then 15 s timeout and panel error question_speech_timeout", async () => {
     const r = await runQuestion({ OLV_FAKE_MUTE_OUTPUT: "1" }, "timeout");
-    const appends = r.tap.filter((e) => e.dir === "in" && e.type === "session.instructions.append");
+    const appends = r.tap.filter((e) => e.dir === "in" && e.type === "session.commentary.append");
     expect(r.timeoutLog!.t - appends[0]!.t).toBeGreaterThanOrEqual(14_900);
-    expect(r.log.filter((e) => e.type === "session.instructions.append")).toHaveLength(2);
+    expect(r.log.filter((e) => e.type === "session.commentary.append")).toHaveLength(2);
     expect(appends).toHaveLength(2);
     expect(appends[1]!.ev.content).toBe(appends[0]!.ev.content);
     expect(appends[1]!.ev.event_id).not.toBe(appends[0]!.ev.event_id);

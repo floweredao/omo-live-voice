@@ -10,7 +10,24 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirS
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { questionToSpeech, INSTRUCTIONS_PREFIX } from "../../bridge/adapter.ts";
+import { norm, orderedMatch } from "../../bridge/question-transcript.ts";
 
+/** Reject numbered alternatives even when all required labels also occur later. */
+export function inventedOptions(text: string, labels: readonly string[]): readonly string[] {
+  const korean = ["일", "이", "삼", "사", "오", "육", "칠", "팔", "구"];
+  const markers = [...text.matchAll(/(?:^|[\s.!?。])([1-9]\d*|일|이|삼|사|오|육|칠|팔|구)(?:번(?:째)?\s*|[.)]\s+)/gu)];
+  return markers.flatMap((marker, i) => {
+    const number = marker[1] ?? "";
+    const index = /^\d+$/.test(number) ? Number(number) - 1 : korean.indexOf(number);
+    const start = (marker.index ?? 0) + marker[0].length;
+    const end = markers[i + 1]?.index ?? text.length;
+    const body = text.slice(start, end);
+    const label = labels[index];
+    return label !== undefined && norm(body).startsWith(norm(label)) ? [] : [text.slice(marker.index, end).trim()];
+  });
+}
+
+async function main(): Promise<void> {
 const ROOT = new URL("../../", import.meta.url).pathname;
 const MAIN = process.env.OLV_MAIN_CHECKOUT ?? join(homedir(), "Documents/Projects/omo-live-voice");
 const LEDGER = process.env.OLV_COST_LEDGER ?? `${MAIN}/.omo/handoff/cost-ledger.jsonl`;
@@ -49,38 +66,6 @@ function ledgerTotal(): number {
   return sum;
 }
 const scrub = (s: string) => s.replace(/sk-[A-Za-z0-9_-]{8,}/g, "sk-***").replace(/token=[0-9a-f]{16,}/g, "token=***").replace(/"token":"[^"]+"/g, '"token":"***"');
-export const norm = (s: string) => s.normalize("NFC").replace(/[\s\p{P}\p{S}]/gu, "");
-
-/** Ordered-fragment check for (l)/(m): returns the first missing/out-of-order fragment, or null when all are in order. */
-export function orderedMatch(text: string, head: string[], options: string[] = []): { missing: string | null; positions: number[] } {
-  const t = norm(text);
-  const positions: number[] = [];
-  let cur = 0;
-  for (const h of head) {
-    const p = t.indexOf(norm(h), cur);
-    if (p < 0) return { missing: h, positions };
-    positions.push(p);
-    cur = p + norm(h).length;
-  }
-  for (let k = 0; k < options.length; k++) {
-    const marker = `${k + 1}번`;
-    const label = norm(options[k]!);
-    let found = -1;
-    for (let p = t.indexOf(marker, cur); p >= 0; p = t.indexOf(marker, p + 1)) {
-      const after = p + marker.length;
-      const q = t.indexOf(label, after);
-      if (q >= 0 && q - after <= 3) {
-        found = q;
-        break;
-      }
-    }
-    if (found < 0) return { missing: `${marker} ${options[k]}`, positions };
-    positions.push(found);
-    cur = found + label.length;
-  }
-  return { missing: null, positions };
-}
-
 const TAP_JS = `
 const T=()=>Date.now();
 const W=(o)=>{try{process.stderr.write("OLV_TAP "+JSON.stringify({t:T(),...o})+"\\n")}catch{}};
@@ -520,21 +505,24 @@ items.l = {
     const done = () => orderedMatch(outputTranscript(ctx, t0), head, LABELS_L).missing === null;
     // fail fast: every chunk appended and no output transcript for 20 s means speech has finished (or stalled)
     const settled = () => {
-      const appended = new Set(ctx.tapsOf("live_send", "session.instructions.append").filter((x) => x.t >= t0).map((x) => String(x.content ?? ""))).size;
+      const appended = new Set(ctx.tapsOf("live_send", "session.commentary.append").filter((x) => x.t >= t0).map((x) => String(x.content ?? ""))).size;
       const last = ctx.tapsOf("live_recv", "session.output_transcript.delta").filter((x) => x.t >= t0).at(-1)?.t ?? t0;
       return appended >= chunks600.length && Date.now() - last > 20_000;
     };
-    await ctx.until(() => done() || settled(), 180_000);
-    const rawSends = ctx.tapsOf("live_send", "session.instructions.append").filter((x) => x.t >= t0);
+    const timedOut = () => p.envs.some((x) => x.e.type === "error" && x.e.code === "question_speech_timeout");
+    await ctx.until(() => timedOut() || done() || settled(), 180_000);
+    const rawSends = ctx.tapsOf("live_send", "session.commentary.append").filter((x) => x.t >= t0);
     // a start-retry re-sends the same chunk content with a new event id: collapse it into its chunk
     const sends = rawSends.filter((s, i) => i === 0 || String(s.content ?? "") !== String(rawSends[i - 1]!.content ?? ""));
     ctx.numbers.startRetries = rawSends.length - sends.length;
     ctx.numbers.retryLog = ctx.log.filter((l) => l.includes("question_chunk_retry"));
     ctx.numbers.sendContentsMatchChunks = sends.length === chunks600.length && sends.every((s, i) => String(s.content ?? "").endsWith(chunks600[i]!));
     const lastSend = sends.at(-1);
-    if (lastSend) await ctx.until(() => extStates(ctx).some((x) => x.t > lastSend.t && x.msg.output !== "speaking" && extStates(ctx).some((y) => y.t > lastSend.t && y.t < x.t && y.msg.output === "speaking")), 30_000);
+    if (lastSend && !timedOut()) await ctx.until(() => timedOut() || extStates(ctx).some((x) => x.t > lastSend.t && x.msg.output !== "speaking" && extStates(ctx).some((y) => y.t > lastSend.t && y.t < x.t && y.msg.output === "speaking")), 30_000);
     const text = outputTranscript(ctx, t0);
     const match = orderedMatch(text, head, LABELS_L);
+    const invented = inventedOptions(text, LABELS_L);
+    ctx.numbers.inventedOptions = invented;
     const states = extStates(ctx);
     void states;
     const outDeltas = ctx.tapsOf("live_recv", "session.output_transcript.delta");
@@ -551,10 +539,17 @@ items.l = {
     ctx.numbers.panelTotalPcmBytes = p.summary().receivedPcmBytes ?? null;
     ctx.numbers.transcript = text;
     ctx.numbers.missingFragment = match.missing;
-    const timedOut = ctx.log.some((l) => l.includes("question_chunk_timeout"));
-    ctx.numbers.questionChunkTimeout = timedOut;
-    const ok = chunks600.length >= 2 && sends.length === chunks600.length && ctx.numbers.sendContentsMatchChunks === true && !timedOut && windows.every((w) => w.afterPrevOutputEnd && w.pcmBytesToPanel > 48_000) && match.missing === null && Number(ctx.numbers.panelTotalPcmBytes) >= windows.reduce((n, w) => n + w.pcmBytesToPanel, 0) * 0.95;
-    return { ok, detail: `chunks sent=${sends.length} (cap350=${chunks350.length}, runtime=${chunks600.length}); missing=${match.missing ?? "none"}; windows=${JSON.stringify(windows)}` };
+    ctx.numbers.fragmentPositions = match.positions;
+    ctx.numbers.repeatedFragments = match.repetitions;
+    ctx.numbers.repeatedOptionNumbers = LABELS_L.flatMap((_, i) => {
+      const marker = `${i + 1}번`;
+      const count = norm(text).split(marker).length - 1;
+      return count > 1 ? [{ marker, extraOccurrences: count - 1 }] : [];
+    });
+    const timeoutSeen = timedOut() || ctx.log.some((l) => l.includes("question_chunk_timeout"));
+    ctx.numbers.questionChunkTimeout = timeoutSeen;
+    const ok = chunks600.length >= 2 && sends.length === chunks600.length && ctx.numbers.sendContentsMatchChunks === true && !timeoutSeen && windows.every((w) => w.afterPrevOutputEnd && w.pcmBytesToPanel > 48_000) && match.missing === null && invented.length === 0 && Number(ctx.numbers.panelTotalPcmBytes) >= windows.reduce((n, w) => n + w.pcmBytesToPanel, 0) * 0.95;
+    return { ok, detail: `chunks sent=${sends.length} (cap350=${chunks350.length}, runtime=${chunks600.length}); missing=${match.missing ?? "none"}; invented=${JSON.stringify(invented)}; windows=${JSON.stringify(windows)}` };
   },
 };
 
@@ -842,7 +837,7 @@ items.m = {
     await ctx.until(() => !!dialog(), 90_000);
     await ctx.until(() => orderedMatch(outputTranscript(ctx, t0), ["빌드 방식", ...labels]).missing === null, 60_000);
     const panelQ = p.envs.find((x) => x.e.type === "agent" && x.e.status === "question");
-    const instr = ctx.tapsOf("live_send", "session.instructions.append").filter((x) => x.t >= t0);
+    const instr = ctx.tapsOf("live_send", "session.commentary.append").filter((x) => x.t >= t0);
     const text = outputTranscript(ctx, t0);
     const match = orderedMatch(text, ["빌드 방식", ...labels]);
     const d = dialog();
@@ -850,7 +845,7 @@ items.m = {
     await ctx.until(() => b.frames.slice(at).some((x) => x.f.type === "agent_end"), 60_000);
     Object.assign(ctx.numbers, { dialogMethod: d?.f.method ?? null, panelAgentQuestion: panelQ?.e.question ?? null, instructionChunks: instr.map((x) => x.content), transcript: text, missingFragment: match.missing, agentEnded: b.frames.slice(at).some((x) => x.f.type === "agent_end") });
     const ok = !!d && !!panelQ && instr.length >= 1 && match.missing === null;
-    return { ok, detail: `dialog=${d?.f.method ?? "none"}; panel agent.question=${!!panelQ}; instructions.append chunks=${instr.length}; missing=${match.missing ?? "none"}; agent_end after cancel=${ctx.numbers.agentEnded}` };
+    return { ok, detail: `dialog=${d?.f.method ?? "none"}; panel agent.question=${!!panelQ}; commentary.append chunks=${instr.length}; missing=${match.missing ?? "none"}; agent_end after cancel=${ctx.numbers.agentEnded}` };
   },
 };
 
@@ -900,3 +895,6 @@ if (fl) {
 }
 if (OUT) writeFileSync(OUT, JSON.stringify({ fake: FAKE, ledgerTotal: ledgerTotal(), rows }, null, 2));
 process.exit(rows.length > 0 && rows.every((r) => r.ok) ? 0 : 1);
+}
+
+if (import.meta.main) await main();
