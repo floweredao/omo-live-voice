@@ -151,6 +151,10 @@ function dispatch(event: Event): void {
       const result = transition(state, ev);
       const wasBusy = state.agent !== "idle";
       state = result.state;
+      if (outGen !== state.playbackGeneration) {
+        outGen = state.playbackGeneration;
+        outSeq = 0;
+      }
       for (const effect of result.effects) {
         try {
           apply(effect);
@@ -208,8 +212,6 @@ function apply(effect: Effect): void {
       state = { ...state, draftHeld: false };
       break;
     case "flushPlayback":
-      outGen = effect.gen;
-      outSeq = 0;
       lastVoicedOut = -Infinity;
       outputEndedLocal = false;
       timers.cancel("outputEnd");
