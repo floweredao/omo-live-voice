@@ -1,6 +1,6 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { accessSync, appendFileSync, constants, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, extname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -309,7 +309,7 @@ export default function omoLiveVoice(pi: ExtensionAPI): void {
         });
       }
       if (proc.pid !== undefined) writeLock({ sessionId, pid: proc.pid, startedAt: new Date().toISOString(), title });
-      send({ type: "hello", sessionId, sessionFile, cwd: ctx.cwd, title, qa: process.env.OLV_QA === "1" });
+      send({ type: "hello", sessionId, sessionFile, cwd: ctx.cwd, title, qa: process.env.OLV_QA === "1" || existsSync(join(homedir(), ".omo-live-voice", "qa-mode")) });
       setStatus("🎙 음성 연결 중");
       return "started";
     };

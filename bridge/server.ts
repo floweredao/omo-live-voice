@@ -1,8 +1,8 @@
 // Panel server: static panel files + one authenticated, single-controller WebSocket on 127.0.0.1.
 // Security boundary: WebSockets ignore CORS, so every upgrade needs the per-launch token AND an allowed Origin.
 
-import { join } from "node:path";
-import type { ServerWebSocket } from "bun";
+import { join, resolve } from "node:path";
+import type { BunRequest, ServerWebSocket } from "bun";
 import { decodeFrame, encodeFrame, FrameError } from "../shared/protocol.ts";
 import type { BridgeToPanel, PanelHello, PanelToBridge } from "../shared/protocol.ts";
 
@@ -40,6 +40,9 @@ export interface StartServerOptions {
   onPanel: (conn: PanelConn) => void;
   port?: number;
   log?: Logger;
+  /** Evaluated per request: QA mode (known only after the extension hello) exposes fixtures under /assets/qa/. */
+  qa?: () => boolean;
+  fixturesDir?: string;
 }
 
 export interface PanelServer {
@@ -116,6 +119,7 @@ export async function startServer(opts: StartServerOptions): Promise<PanelServer
   const log = opts.log ?? defaultLog;
   const requested = opts.port ?? Number(process.env.OLV_PORT ?? DEFAULT_PORT);
   const indexPath = join(opts.panelDir, "index.html");
+  const fixturesDir = opts.fixturesDir ?? resolve(import.meta.dir, "../fixtures");
   let controller: Conn | null = null;
   let seq = 0;
   const stamp = (msg: OutboundMsg): string => JSON.stringify({ ...msg, v: 1, seq: ++seq });
@@ -135,6 +139,13 @@ export async function startServer(opts: StartServerOptions): Promise<PanelServer
       routes: {
         // Token is never embedded: the panel reads ?token= from location.search.
         "/": () => new Response(Bun.file(indexPath), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } }),
+        "/assets/qa/:name": async (req: BunRequest<"/assets/qa/:name">) => {
+          const name = req.params.name;
+          if (!opts.qa?.() || !/^[a-z0-9-]+\.wav$/.test(name)) return new Response("not found", { status: 404 });
+          const file = Bun.file(join(fixturesDir, name));
+          if (!(await file.exists())) return new Response("not found", { status: 404 });
+          return new Response(file, { headers: { "content-type": "audio/wav", "cache-control": "no-store" } });
+        },
         "/assets/*": { dir: opts.panelDir },
       },
       fetch(req, server) {

@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import voiceExtension from "../extension/index.ts";
 
 const FAKE_BRIDGE = join(import.meta.dir, "fixtures/fake-bridge.sh");
-const ENV_KEYS = ["OLV_BUN", "OLV_DATA_DIR", "OLV_OPEN_CMD", "OLV_STOP_TIMEOUT_MS", "FAKE_BRIDGE_LOG", "FAKE_BRIDGE_SCRIPT", "FAKE_BRIDGE_IGNORE_STOP"];
+const EXTENSION_URL = pathToFileURL(join(import.meta.dir, "../extension/index.ts")).href;
+const ENV_KEYS = ["OLV_BUN", "OLV_DATA_DIR", "OLV_OPEN_CMD", "OLV_STOP_TIMEOUT_MS", "OLV_QA", "FAKE_BRIDGE_LOG", "FAKE_BRIDGE_SCRIPT", "FAKE_BRIDGE_IGNORE_STOP"];
 
 let listeners = new Set<() => void>();
 const tick = () => {
@@ -138,6 +140,76 @@ function setup(sessionFile = "/sessions/s-one.jsonl") {
   return { pi, ctx };
 }
 
+function runQaChild(mode: "with-flag" | "without-flag" | "registration-only"): string {
+  const home = join(dir, `home-${mode}`);
+  mkdirSync(join(home, ".omo-live-voice"), { recursive: true });
+  if (mode === "with-flag") writeFileSync(join(home, ".omo-live-voice", "qa-mode"), "");
+  const homeBoot = join(dir, `home-boot-${mode}.cjs`);
+  writeFileSync(homeBoot, `
+    const os = require("node:os");
+    const fs = require("node:fs");
+    const original = os.homedir;
+    os.homedir = () => ${JSON.stringify(home)};
+    const existsSync = fs.existsSync;
+    globalThis.__qaFlagChecks = 0;
+    fs.existsSync = (path, ...args) => {
+      if (String(path) === ${JSON.stringify(join(home, ".omo-live-voice", "qa-mode"))}) globalThis.__qaFlagChecks++;
+      return existsSync(path, ...args);
+    };
+    process.on("exit", () => { os.homedir = original; });
+  `);
+  const script = `
+    import voiceExtension from ${JSON.stringify(EXTENSION_URL)};
+    const pi = {
+      registerCommand(_name, command) { this.command = command; },
+      registerTool() {},
+      on() {},
+      events: { on() {} },
+      sendMessage() {},
+      sendUserMessage() {},
+    };
+    voiceExtension(pi);
+    if (${JSON.stringify(mode)} === "registration-only") {
+      process.stdout.write(JSON.stringify({ registered: true, flagChecks: globalThis.__qaFlagChecks }));
+    } else {
+      process.env.OLV_BUN = ${JSON.stringify(FAKE_BRIDGE)};
+      process.env.OLV_DATA_DIR = ${JSON.stringify(join(dir, `data-${mode}`))};
+      process.env.FAKE_BRIDGE_LOG = ${JSON.stringify(join(dir, `fake-${mode}.log`))};
+      process.env.FAKE_BRIDGE_SCRIPT = ${JSON.stringify(join(dir, "script.jsonl"))};
+      delete process.env.OLV_QA;
+      const logPath = ${JSON.stringify(join(dir, `fake-${mode}.log`))};
+      const fs = await import("node:fs");
+      const receivedHello = new Promise((resolve, reject) => {
+        const watcher = fs.watch(${JSON.stringify(dir)}, (_event, name) => {
+          if (String(name) !== logPath.split("/").pop() || !fs.existsSync(logPath)) return;
+          const log = fs.readFileSync(logPath, "utf8");
+          if (!log.includes("recv ")) return;
+          watcher.close();
+          resolve(log);
+        });
+        setTimeout(() => {
+          watcher.close();
+          reject(new Error("fake bridge did not receive hello"));
+        }, 5000);
+      });
+      await pi.command.handler("", {
+        cwd: ${JSON.stringify(dir)},
+        sessionManager: { getSessionFile: () => "/sessions/qa-child.jsonl", getSessionName: () => undefined },
+        ui: { notify() {}, setStatus() {} },
+        isIdle: () => true,
+      });
+      process.stdout.write(await receivedHello);
+      process.exit(0);
+    }
+  `;
+  const result = spawnSync(process.execPath, ["--require", homeBoot, "-e", script], {
+    encoding: "utf8",
+    env: { ...process.env, HOME: home },
+  });
+  if (result.status !== 0) throw new Error(result.stderr || `QA child exited ${result.status}`);
+  return result.stdout;
+}
+
 function script(...lines: object[]) {
   writeFileSync(join(dir, "script.jsonl"), lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
 }
@@ -149,6 +221,7 @@ async function startVoice(pi: FakePi, ctx: FakeCtx) {
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "olv-ext-test-"));
+  mkdirSync(join(dir, "home", ".omo-live-voice"), { recursive: true });
   mkdirSync(join(dir, "data"), { recursive: true });
   listeners = new Set();
   watcher = watch(dir, { recursive: true }, tick);
@@ -179,6 +252,7 @@ describe("registration", () => {
     expect(pi.userMessages.length + pi.customMessages.length).toBe(0);
     expect(existsSync(join(dir, "fake.log"))).toBe(false);
     expect(readdirSync(join(dir, "data"))).toEqual([]);
+    expect(existsSync(join(dir, "home", ".omo-live-voice", "qa-mode"))).toBe(false);
   });
 
   test("argument completions offer the subcommands", () => {
@@ -189,6 +263,23 @@ describe("registration", () => {
 });
 
 describe("/voice lifecycle", () => {
+  test("/voice hello enables QA from the HOME file flag", async () => {
+    writeFileSync(join(dir, "home", ".omo-live-voice", "qa-mode"), "");
+    const output = runQaChild("with-flag");
+    expect(output).toContain('"qa":true');
+  });
+
+  test("/voice hello keeps QA disabled without env or file flag", async () => {
+    const output = runQaChild("without-flag");
+    expect(output).toContain('"qa":false');
+  });
+
+  test("registration does not inspect the QA flag", () => {
+    const output = runQaChild("registration-only");
+    expect(JSON.parse(output)).toEqual({ registered: true, flagChecks: 0 });
+    expect(existsSync(join(dir, "fake.log"))).toBe(false);
+  });
+
   test("/voice spawns the bridge, writes the lock, sends hello and sets status", async () => {
     const { pi, ctx } = setup();
     await startVoice(pi, ctx);

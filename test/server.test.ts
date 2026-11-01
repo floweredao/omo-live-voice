@@ -90,6 +90,29 @@ test("GET / serves the panel without embedding the token; assets are served", as
   expect((await fetch(`http://127.0.0.1:${s.port}/assets/..%2F..%2Fetc%2Fpasswd`)).status).not.toBe(200);
 });
 
+async function startQa(qa: boolean) {
+  const s = await startServer({ panelDir, token: TOKEN, allowedOrigins: [], onPanel: () => {}, port: 0, log, qa: () => qa });
+  servers.push(s);
+  return s;
+}
+
+test("QA mode serves /assets/qa/<name>.wav from fixtures; names are restricted", async () => {
+  const s = await startQa(true);
+  const res = await fetch(`http://127.0.0.1:${s.port}/assets/qa/ko-list-files.wav`);
+  expect(res.status).toBe(200);
+  expect(new TextDecoder().decode((await res.arrayBuffer()).slice(0, 4))).toBe("RIFF");
+  expect((await fetch(`http://127.0.0.1:${s.port}/assets/qa/..%2Fpackage.json`)).status).toBe(404);
+  expect((await fetch(`http://127.0.0.1:${s.port}/assets/qa/x.txt`)).status).toBe(404);
+  expect((await fetch(`http://127.0.0.1:${s.port}/assets/qa/missing.wav`)).status).toBe(404);
+});
+
+test("outside QA mode /assets/qa/*.wav is 404", async () => {
+  const s = await startQa(false);
+  expect((await fetch(`http://127.0.0.1:${s.port}/assets/qa/ko-list-files.wav`)).status).toBe(404);
+  const noOpt = await start();
+  expect((await fetch(`http://127.0.0.1:${noOpt.port}/assets/qa/ko-list-files.wav`)).status).toBe(404);
+});
+
 test("/ws without token -> 401 unauthorized", async () => {
   const s = await start();
   const res = await rawUpgrade(s.port, "", `http://127.0.0.1:${s.port}`);
