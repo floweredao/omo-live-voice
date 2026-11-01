@@ -28,26 +28,37 @@ function cleanMarkdown(text: string): Cleaned {
   const lines: string[] = [];
   const rawLines = text.split(/\r?\n/);
   let inDiff = false;
+  let diffIndent = "";
   let oldLeft = 0;
   let newLeft = 0;
 
   for (const [i, raw] of rawLines.entries()) {
-    const t = raw.trim();
-    if (t.startsWith("```") || t.startsWith("~~~")) {
+    let t = raw.trim();
+    const fence = /^(`{3,}|~{3,})/.exec(t);
+    if (fence) {
       inFence = !inFence;
       removedCode = true;
       prevCode = true;
       prevBlank = false;
-      continue;
+      if (inFence) continue;
+      t = t.slice(fence[0].length).trim();
+      if (t === "") continue;
     }
     if (inFence) {
       removedCode = true;
       continue;
     }
+    const trailingFence = /(`{3,}|~{3,})$/.exec(t);
+    if (trailingFence && !t.slice(0, trailingFence.index).includes(trailingFence[0])) {
+      inFence = true;
+      removedCode = true;
+      t = t.slice(0, trailingFence.index).trimEnd();
+    }
     const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(t);
     if (t.startsWith("diff --git ") || t.startsWith("@@ ") ||
         (t.startsWith("--- a/") && rawLines[i + 1]?.trim().startsWith("+++ b/"))) {
       inDiff = true;
+      diffIndent = raw.slice(0, raw.length - raw.trimStart().length);
       oldLeft = hunk ? Number(hunk[1] ?? 1) : -1;
       newLeft = hunk ? Number(hunk[2] ?? 1) : -1;
       removedCode = true;
@@ -59,10 +70,12 @@ function cleanMarkdown(text: string): Cleaned {
         continue;
       }
       // Hunk lengths distinguish following bullets from diff additions/deletions.
-      if ((oldLeft !== 0 || newLeft !== 0) && /^[ +\-]/.test(raw) && raw !== "") {
+      const line = raw.startsWith(diffIndent) ? raw.slice(diffIndent.length) : raw;
+      if ((oldLeft !== 0 || newLeft !== 0) &&
+          (/^[ +\-]/.test(line) || (line === "" && (oldLeft > 0 || newLeft > 0)))) {
         removedCode = true;
-        if (raw[0] !== "+") oldLeft--;
-        if (raw[0] !== "-") newLeft--;
+        if (line[0] !== "+") oldLeft--;
+        if (line[0] !== "-") newLeft--;
         continue;
       }
       inDiff = false;
