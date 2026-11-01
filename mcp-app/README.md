@@ -1,3 +1,1 @@
-# mcp-app
-
-MCP app surface for the voice panel.
+Not built: P0 verdict panelHost=browser-tab (see .omo/handoff/p0/n0-mcp-app-panel.md)
