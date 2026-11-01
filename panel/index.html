@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>OmO 음성 패널</title>
+  <!-- bridge/server.ts serves this file at "/" and the rest of panel/dist under "/assets/", so the
+       relative ./app.js, ./styles.css and ./worklets/* references below resolve through this base.
+       The per-launch token is never embedded here: app.js reads it from location.search. -->
+  <script>
+    if (location.pathname === "/") {
+      var base = document.createElement("base");
+      base.href = "/assets/";
+      document.head.appendChild(base);
+    }
+  </script>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main id="shell" class="shell" data-state="connecting" data-worklets="./worklets/"
+        data-worklet-capture="./worklets/capture.worklet.js" data-worklet-playback="./worklets/playback.worklet.js">
+    <header class="topbar">
+      <div class="topbar-row">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <h1 class="brand-title">OmO 음성</h1>
+          <span id="session-label" class="session-label">세션 연결 중</span>
+        </div>
+        <output id="cost" class="cost" data-testid="cost" aria-label="연결 시간과 예상 비용">00:00 · 예상 $0.00</output>
+      </div>
+      <div class="status-row">
+        <span id="state" class="state-pill" data-testid="state" data-state="connecting" role="status" aria-live="polite">
+          <i class="status-dot" aria-hidden="true"></i><span id="state-text">연결 중</span>
+        </span>
+        <span id="agent-state" class="agent-pill" data-testid="agent-state" role="status" aria-live="polite" hidden></span>
+      </div>
+    </header>
+
+    <p id="notice" class="notice" data-testid="notice" role="status" hidden></p>
+
+    <div id="error" class="toast" data-testid="error" role="alert" hidden>
+      <span id="error-text" class="toast-text"></span>
+      <button id="error-dismiss" type="button" class="toast-dismiss" aria-label="알림 닫기">닫기</button>
+    </div>
+
+    <section id="question" class="card card-question" data-testid="question" aria-live="polite" hidden>
+      <p class="card-kicker">에이전트의 질문</p>
+      <h2 id="question-header" class="question-header"></h2>
+      <p id="question-body" class="question-body"></p>
+      <ol id="question-options" class="question-options"></ol>
+      <p class="card-hint">번호나 항목 이름을 말해 주세요.</p>
+    </section>
+
+    <section id="draft" class="card card-draft" data-testid="draft" aria-live="polite" hidden>
+      <div class="card-head">
+        <p class="card-kicker">보내기 전 확인</p>
+        <span class="card-hint">"보내"라고 말하거나 버튼을 눌러 주세요</span>
+      </div>
+      <p id="draft-text" class="draft-text"></p>
+      <div class="card-actions">
+        <button id="draft-confirm" type="button" class="btn btn-primary" data-testid="draft-confirm">보내기</button>
+        <button id="draft-discard" type="button" class="btn" data-testid="draft-discard">취소</button>
+      </div>
+    </section>
+
+    <section class="captions" aria-label="실시간 자막">
+      <article class="pane pane-user">
+        <header class="pane-head">
+          <span class="pane-title">내 말</span>
+          <span id="user-count" class="pane-count">0</span>
+        </header>
+        <div id="user-caption" class="pane-scroll" data-testid="user-caption" role="log" aria-live="polite">
+          <p class="pane-empty">말을 시작하면 여기에 자막이 나타나요.</p>
+        </div>
+      </article>
+      <article class="pane pane-assistant">
+        <header class="pane-head">
+          <span class="pane-title">어시스턴트</span>
+          <span id="assistant-count" class="pane-count">0</span>
+        </header>
+        <div id="assistant-caption" class="pane-scroll" data-testid="assistant-caption" role="log" aria-live="polite">
+          <p class="pane-empty">어시스턴트의 말이 여기에 나타나요.</p>
+        </div>
+      </article>
+    </section>
+
+    <footer class="controls">
+      <div class="controls-row">
+        <button id="mute" type="button" class="btn btn-mute" data-testid="mute" aria-pressed="false" title="단축키: M 또는 스페이스">
+          <span class="btn-dot" aria-hidden="true"></span><span id="mute-label">음소거 (M)</span>
+        </button>
+        <button id="resume" type="button" class="btn" data-testid="resume" disabled>재개</button>
+        <button id="stop" type="button" class="btn btn-danger" data-testid="stop">중지</button>
+        <button id="qa-inject" type="button" class="btn btn-ghost" data-testid="qa-inject" hidden>QA 음성 주입</button>
+      </div>
+      <div class="devices">
+        <label class="device">
+          <span class="device-label">마이크</span>
+          <select id="device-input" class="device-select" data-testid="device-input">
+            <option value="">기본 마이크</option>
+          </select>
+        </label>
+        <label class="device">
+          <span class="device-label">스피커</span>
+          <select id="device-output" class="device-select" data-testid="device-output">
+            <option value="">기본 스피커</option>
+          </select>
+        </label>
+      </div>
+    </footer>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
