@@ -2,6 +2,16 @@
   "name": "omo-live-voice",
   "private": true,
   "type": "module",
+  "description": "Real-time voice interaction for OmO coding-agent sessions using GPT-Live.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/floweredao/omo-live-voice.git"
+  },
+  "engines": {
+    "bun": ">=1.4"
+  },
+  "version": "0.1.0",
   "scripts": {
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit -p tsconfig.json",

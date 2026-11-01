@@ -1,6 +1,10 @@
 node_modules/
 .env*
 *.key
+*.pem
+*.p12
+*.p8
+*.crt
 .omo/
 panel/dist/
 mcp-app/dist/
