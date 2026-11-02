@@ -170,13 +170,18 @@ export function base64ToPcm(base64: string): Int16Array {
   return pcm;
 }
 
+// With gapMs, earlier speech separated from the last run by at least gapMs of silence is left out.
 export function transcriptWindow(
   fragments: { text: string; startMs: number; endMs: number }[],
   fromMs: number,
   toMs: number,
+  gapMs = Infinity,
 ): string {
-  return fragments
-    .filter((fragment) => fragment.endMs >= fromMs && fragment.startMs <= toMs)
+  const inWindow = fragments.filter((fragment) => fragment.endMs >= fromMs && fragment.startMs <= toMs);
+  let start = inWindow.length - 1;
+  while (start > 0 && inWindow[start]!.startMs - inWindow[start - 1]!.endMs < gapMs) start--;
+  return inWindow
+    .slice(Math.max(start, 0))
     .map((fragment) => fragment.text)
     .join("");
 }
