@@ -291,7 +291,7 @@ describe("/voice lifecycle", () => {
     expect(ctx.statuses.some((s) => s.key === "voice" && s.text?.includes("음성 연결 중"))).toBe(true);
   });
 
-  test("utterance message -> sendUserMessage with steer while busy, plain while idle", async () => {
+  test("utterance message -> sendUserMessage with steer while busy and while idle", async () => {
     script({ type: "utterance", id: "u1", text: "테스트 해 줘", kind: "message" });
     const busy = setup();
     busy.ctx.idle = false;
@@ -303,7 +303,27 @@ describe("/voice lifecycle", () => {
     const idle = setup("/sessions/s-two.jsonl");
     await startVoice(idle.pi, idle.ctx);
     await waitFor(() => idle.pi.userMessages.length === 1, 5000, "idle sendUserMessage");
-    expect(idle.pi.userMessages[0]).toEqual({ text: "테스트 해 줘", options: undefined });
+    expect(idle.pi.userMessages[0]).toEqual({ text: "테스트 해 줘", options: { deliverAs: "steer" } });
+  });
+
+  test("two utterances before the first run starts both reach the session (#9)", async () => {
+    script(
+      { type: "utterance", id: "u1", text: "현재 폴더 파일 목록 보여 줘", kind: "message" },
+      { type: "utterance", id: "u2", text: "테스트도 돌려 줘", kind: "message" },
+    );
+    // Given: isIdle() stays true until the first run starts streaming.
+    const { pi, ctx } = setup();
+    // The runtime rejects a message without deliverAs while an earlier prompt is still starting.
+    const accepted: string[] = [];
+    pi.sendUserMessage = (text: string, options?: unknown) => {
+      const queued = (options as { deliverAs?: string } | undefined)?.deliverAs !== undefined;
+      if (accepted.length === 0 || queued) accepted.push(text);
+      pi.userMessages.push({ text, options });
+      tick();
+    };
+    await startVoice(pi, ctx);
+    await waitFor(() => pi.userMessages.length === 2, 5000, "both utterances sent");
+    expect(accepted).toEqual(["현재 폴더 파일 목록 보여 줘", "테스트도 돌려 줘"]);
   });
 
   test("utterance cancel -> abort once when busy, never when idle", async () => {
