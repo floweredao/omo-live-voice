@@ -213,7 +213,9 @@ export default function omoLiveVoice(pi: ExtensionAPI): void {
           if (msg.kind === "message") {
             pending.push({ id: msg.id, text: msg.text });
             if (pending.length > 50) pending.shift();
-            pi.sendUserMessage(msg.text, idle ? undefined : { deliverAs: "steer" });
+            // Always steer: isIdle() stays true while an earlier prompt is still starting, and the
+            // runtime rejects a message without deliverAs then. When truly idle it ignores deliverAs.
+            pi.sendUserMessage(msg.text, { deliverAs: "steer" });
           } else if (msg.kind === "cancel") {
             if (!idle) ctxRef?.abort();
           } else if (!ASK_USER_ANSWER_API) {
