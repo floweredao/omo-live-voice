@@ -91,6 +91,18 @@ describe("audio core", () => {
     expect(transcriptWindow(fragments, 150, 250)).toBe("hello world");
   });
 
+  test("transcriptWindow with a gap keeps only the last speech run", () => {
+    const fragments = [
+      { text: "그죠", startMs: 0, endMs: 400 },
+      { text: "현재 폴더의 ", startMs: 5000, endMs: 5800 },
+      { text: "파일 목록", startMs: 6800, endMs: 7500 },
+    ];
+    expect(transcriptWindow(fragments, 0, 8000, 1500)).toBe("현재 폴더의 파일 목록");
+    expect(transcriptWindow(fragments, 0, 8000, 900)).toBe("파일 목록");
+    expect(transcriptWindow(fragments, 0, 8000)).toBe("그죠현재 폴더의 파일 목록");
+    expect(transcriptWindow([], 0, 8000, 1500)).toBe("");
+  });
+
   test("PCM helpers concatenate and round-trip little-endian samples", () => {
     const samples = concatPcm([new Int16Array([1, -2]), new Int16Array([32767])]);
     expect(base64ToPcm(pcmToBase64(samples))).toEqual(samples);

@@ -42,6 +42,9 @@ const ACTIVE_WINDOW_MS = 30_000;
 const HISTORY_LINES = 10;
 const COST_TICK_MS = 1_000;
 const CUT_PAD_MS = 500;
+// Speech followed by this much silence before the delegated request was a separate turn that
+// GPT-Live handled without delegating (a backchannel, a repeat); it is not forwarded (#10).
+const UTTERANCE_GAP_MS = 1500;
 const SEND_WORDS = /^(보내|보내줘|전송|send)$/i;
 const ANSWER_ON_SCREEN = "화면에서 답해 주세요";
 
@@ -359,7 +362,7 @@ function completeInputTurn(): void {
 
 function settleUtterance(offsetMs: number, delegationId: string | null): void {
   const cut = offsetMs + CUT_PAD_MS;
-  const text = transcriptWindow(fragments, lastCutMs, cut).trim();
+  const text = transcriptWindow(fragments, lastCutMs, cut, UTTERANCE_GAP_MS).trim();
   lastCutMs = cut;
   fragments = fragments.filter((f) => f.endMs > cut);
   inputTurn = inputTurn.filter((f) => f.endMs > cut);
