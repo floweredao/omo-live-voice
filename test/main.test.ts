@@ -341,6 +341,41 @@ describe("P6 bridge regressions", () => {
   });
 });
 
+describe("undelegated speech (#10)", () => {
+  test("speech GPT-Live answered without delegating is not forwarded with the next request", async () => {
+    // Given: GPT-Live answers a backchannel by voice and never delegates it.
+    const h = await regressionBridge();
+    await h.delta("그죠", 0, 400);
+    await h.output("네, 맞아요.");
+    // When: a later request is delegated.
+    await h.delta("현재 폴더의 파일 목록을 보여줘", 5000, 6500);
+    const forwarded = h.bridge.nextJson("utterance", 2000);
+    h.live.emit({ type: "session.delegation.created", offset_ms: 6500, delegation: { id: "request" } });
+    await h.syncLive();
+    await h.clock(600);
+    // Then: only the delegated request reaches the agent.
+    expect(await forwarded).toMatchObject({ kind: "message", text: "현재 폴더의 파일 목록을 보여줘" });
+    h.bridge.send({ type: "stop" });
+    expect(await bounded(h.bridge.proc.exited, 3000, "undelegated exit")).toBe(0);
+  });
+
+  test("a short pause inside one request keeps the whole request", async () => {
+    // Given: the user pauses for one second in the middle of a request.
+    const h = await regressionBridge();
+    await h.delta("현재 폴더의 ", 0, 800);
+    await h.delta("파일 목록을 보여줘", 1800, 3000);
+    const forwarded = h.bridge.nextJson("utterance", 2000);
+    // When: GPT-Live delegates once at the end.
+    h.live.emit({ type: "session.delegation.created", offset_ms: 3000, delegation: { id: "paused" } });
+    await h.syncLive();
+    await h.clock(600);
+    // Then: both halves are forwarded together.
+    expect(await forwarded).toMatchObject({ kind: "message", text: "현재 폴더의 파일 목록을 보여줘" });
+    h.bridge.send({ type: "stop" });
+    expect(await bounded(h.bridge.proc.exited, 3000, "paused request exit")).toBe(0);
+  });
+});
+
 describe("P3 question chunks", () => {
   test("transcript deltas hold the next chunk until both streams are quiet", async () => {
     // Given: the current chunk has voiced PCM, followed by continuing transcript deltas.
