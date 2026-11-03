@@ -38,7 +38,6 @@ beforeAll(async () => {
       },
     },
   });
-  process.env.OLV_LIVE_URL = `ws://127.0.0.1:${server.port}`;
   config = await import("../bridge/config.ts");
   ({ LiveSession } = await import("../bridge/live.ts"));
 });
@@ -46,7 +45,7 @@ beforeAll(async () => {
 function fresh(b: Behavior = defaultBehavior) {
   got = { auth: null, messages: [], sockets: [] };
   behavior = b;
-  const s = new LiveSession({ apiKey: "test-key", log: (l) => lines.push(l) });
+  const s = new LiveSession({ apiKey: "test-key", url: `ws://127.0.0.1:${server.port}`, log: (l) => lines.push(l) });
   live.push(s);
   return s;
 }
