@@ -12,7 +12,8 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    # The product is macOS-only (Keychain via /usr/bin/security, BSD ps in tests), so a Linux runner fails its tests.
+    runs-on: macos-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -22,5 +23,5 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun run build:panel
-      # test/e2e/p2.test.ts drives a local Chrome and the OmO.app runtime at fixed macOS paths, so it only runs on a Mac.
+      # test/e2e/p2.test.ts drives a local Chrome and the OmO.app runtime at fixed macOS paths, so it is not run here.
       - run: bun test test/*.test.ts test/e2e/p1.test.ts
